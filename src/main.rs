@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v2/auth/{provider}/", get(auth::start))
+        .route("/v2/auth/{provider}/redirect/", get(auth::callback))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

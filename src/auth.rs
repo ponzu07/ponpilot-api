@@ -5,11 +5,12 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::Redirect,
 };
 use rand::distr::{Alphanumeric, SampleString};
-use url::Url;
+use serde::Deserialize;
+use url::{Url, form_urlencoded};
 
 use crate::{
     AppState,
@@ -30,7 +31,6 @@ impl StateStore {
         token
     }
 
-    #[allow(dead_code)]
     pub fn consume(&self, token: &str) -> bool {
         let issued = self.0.lock().unwrap().remove(token);
         issued.is_some_and(|at| at.elapsed() < STATE_TTL)
@@ -60,4 +60,32 @@ pub async fn start(State(state): State<AppState>, Path(provider): Path<String>) 
     };
 
     Ok(Redirect::to(url.as_str()))
+}
+
+#[derive(Deserialize)]
+pub struct Callback {
+    code: String,
+    state: String,
+}
+
+pub async fn callback(
+    State(app): State<AppState>,
+    Path(provider): Path<String>,
+    Query(params): Query<Callback>,
+) -> Result<Redirect> {
+    if provider != "h" {
+        return Err(Error::UnknownProvider(provider));
+    }
+    if !app.states.consume(&params.state) {
+        return Err(Error::InvalidState);
+    }
+
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("code", &params.code)
+        .append_pair("provider", &provider)
+        .finish();
+    Ok(Redirect::to(&format!(
+        "{}/auth/?{query}",
+        app.config.frontend_url
+    )))
 }

@@ -11,13 +11,15 @@ pub enum Error {
     UnknownProvider(String),
     #[error("{0} auth is not configured")]
     ProviderDisabled(&'static str),
+    #[error("invalid or expired state")]
+    InvalidState,
 }
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
             Error::UnknownProvider(_) => StatusCode::NOT_FOUND,
-            Error::ProviderDisabled(_) => StatusCode::BAD_REQUEST,
+            Error::ProviderDisabled(_) | Error::InvalidState => StatusCode::BAD_REQUEST,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
