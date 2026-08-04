@@ -9,6 +9,10 @@ use serde_json::json;
 pub enum Error {
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
+    #[error("not found")]
+    NotFound,
     #[error("unknown provider")]
     UnknownProvider,
     #[error("provider is not configured")]
@@ -25,7 +29,8 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
-            Error::UnknownProvider => StatusCode::NOT_FOUND,
+            Error::Forbidden => StatusCode::FORBIDDEN,
+            Error::NotFound | Error::UnknownProvider => StatusCode::NOT_FOUND,
             Error::ProviderDisabled | Error::InvalidState | Error::ExchangeFailed => {
                 StatusCode::BAD_REQUEST
             }

@@ -20,7 +20,9 @@ const STATE_COOKIE: &str = "__Host-oauth_state";
 fn set_state(value: &str, max_age: u32) -> [(header::HeaderName, String); 1] {
     [(
         header::SET_COOKIE,
-        format!("{STATE_COOKIE}={value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}"),
+        format!(
+            "{STATE_COOKIE}={value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}"
+        ),
     )]
 }
 
@@ -30,7 +32,11 @@ fn issued_state(headers: &HeaderMap) -> Option<&str> {
         .to_str()
         .ok()?
         .split(';')
-        .find_map(|c| c.trim().strip_prefix(STATE_COOKIE).and_then(|v| v.strip_prefix('=')))
+        .find_map(|c| {
+            c.trim()
+                .strip_prefix(STATE_COOKIE)
+                .and_then(|v| v.strip_prefix('='))
+        })
 }
 
 pub async fn start(
@@ -40,11 +46,7 @@ pub async fn start(
     if provider != "h" {
         return Err(Error::UnknownProvider);
     }
-    let github = app
-        .config
-        .github
-        .as_ref()
-        .ok_or(Error::ProviderDisabled)?;
+    let github = app.config.github.as_ref().ok_or(Error::ProviderDisabled)?;
 
     let state = Alphanumeric.sample_string(&mut rand::rng(), 32);
     let mut url = Url::parse("https://github.com/login/oauth/authorize").unwrap();
@@ -105,11 +107,7 @@ pub async fn exchange(
     if params.provider != "h" {
         return Err(Error::UnknownProvider);
     }
-    let github = app
-        .config
-        .github
-        .as_ref()
-        .ok_or(Error::ProviderDisabled)?;
+    let github = app.config.github.as_ref().ok_or(Error::ProviderDisabled)?;
 
     let body = app
         .http

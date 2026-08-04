@@ -1,6 +1,8 @@
+mod athena;
 mod auth;
 mod config;
 mod db;
+mod device;
 mod error;
 mod token;
 mod user;
@@ -51,7 +53,11 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/me/", get(user::me))
-        .route("/v1/me/devices/", get(user::devices))
+        .route("/v1/me/devices/", get(device::list))
+        .route("/v1.1/devices/{dongle_id}", get(device::get))
+        .route("/v1.1/devices/{dongle_id}/", get(device::get))
+        .route("/v2/pilotpair/", post(device::pilotpair))
+        .route("/ws/v2/{dongle_id}", get(athena::ws))
         .route("/v2/auth/", post(auth::exchange))
         .route("/v2/auth/{provider}/", get(auth::start))
         .route("/v2/auth/{provider}/redirect/", get(auth::callback))

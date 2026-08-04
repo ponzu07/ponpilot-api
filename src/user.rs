@@ -50,7 +50,3 @@ pub async fn me(State(app): State<AppState>, user: CurrentUser) -> Json<Value> {
         "prime": true,
     }))
 }
-
-pub async fn devices(_: CurrentUser) -> Json<Value> {
-    Json(json!([]))
-}

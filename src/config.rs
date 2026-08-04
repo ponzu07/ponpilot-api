@@ -34,7 +34,10 @@ impl Config {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
-            github: match (optional("GITHUB_CLIENT_ID"), optional("GITHUB_CLIENT_SECRET")) {
+            github: match (
+                optional("GITHUB_CLIENT_ID"),
+                optional("GITHUB_CLIENT_SECRET"),
+            ) {
                 (Some(client_id), Some(client_secret)) => Some(OAuthProvider {
                     client_id,
                     client_secret,
