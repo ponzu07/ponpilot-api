@@ -5,6 +5,7 @@ COPY src ./src
 RUN cargo build --release
 
 FROM debian:bookworm-slim
+LABEL org.opencontainers.image.source=https://github.com/ponzu07/ponpilot-api
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates wget \
  && rm -rf /var/lib/apt/lists/*
