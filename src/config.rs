@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 
 pub struct Config {
@@ -6,6 +8,7 @@ pub struct Config {
     pub frontend_url: String,
     pub database: String,
     pub jwt_secret: String,
+    superusers: HashSet<String>,
     pub github: Option<OAuthProvider>,
 }
 
@@ -26,6 +29,11 @@ impl Config {
                 anyhow::ensure!(s.len() >= 32, "JWT_SECRET must be at least 32 bytes");
                 s
             },
+            superusers: optional("SUPERUSERS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect(),
             github: match (optional("GITHUB_CLIENT_ID"), optional("GITHUB_CLIENT_SECRET")) {
                 (Some(client_id), Some(client_secret)) => Some(OAuthProvider {
                     client_id,
@@ -34,6 +42,12 @@ impl Config {
                 _ => None,
             },
         })
+    }
+}
+
+impl Config {
+    pub fn is_superuser(&self, identity: &str) -> bool {
+        self.superusers.contains(identity)
     }
 }
 

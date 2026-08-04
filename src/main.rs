@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod error;
 mod token;
+mod user;
 
 use std::sync::Arc;
 
@@ -49,6 +50,8 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/v1/me/", get(user::me))
+        .route("/v1/me/devices/", get(user::devices))
         .route("/v2/auth/", post(auth::exchange))
         .route("/v2/auth/{provider}/", get(auth::start))
         .route("/v2/auth/{provider}/redirect/", get(auth::callback))

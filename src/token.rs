@@ -21,7 +21,6 @@ pub fn issue(secret: &str, identity: &str) -> jsonwebtoken::errors::Result<Strin
     )
 }
 
-#[allow(dead_code)]
 pub fn verify(secret: &str, token: &str) -> jsonwebtoken::errors::Result<UserClaims> {
     decode::<UserClaims>(
         token,

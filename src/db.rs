@@ -27,6 +27,15 @@ pub async fn upsert_user(pool: &SqlitePool, identity: &str, username: &str) -> R
     .await?)
 }
 
+pub async fn find_user(pool: &SqlitePool, identity: &str) -> Result<Option<(i64, String)>> {
+    Ok(
+        sqlx::query_as("SELECT id, username FROM users WHERE identity = ?1")
+            .bind(identity)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
