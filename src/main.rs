@@ -4,6 +4,8 @@ mod config;
 mod db;
 mod device;
 mod error;
+mod route;
+mod sigv4;
 mod token;
 mod user;
 
@@ -57,6 +59,13 @@ async fn main() -> Result<()> {
         .route("/v1.1/devices/{dongle_id}", get(device::get))
         .route("/v1.1/devices/{dongle_id}/", get(device::get))
         .route("/v2/pilotpair/", post(device::pilotpair))
+        .route("/v1.4/{dongle_id}/upload_url/", get(route::upload_url))
+        .route(
+            "/v1/devices/{dongle_id}/routes_segments",
+            get(route::routes_segments),
+        )
+        .route("/v1/route/{route_name}/files", get(route::files))
+        .route("/v1/segments/{d}/{route}/{seg}/{file}", get(route::empty))
         .route("/ws/v2/{dongle_id}", get(athena::ws))
         .route("/v2/auth/", post(auth::exchange))
         .route("/v2/auth/{provider}/", get(auth::start))

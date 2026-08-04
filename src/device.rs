@@ -60,7 +60,7 @@ pub fn valid_dongle_id(s: &str) -> bool {
 pub struct Device {
     dongle_id: String,
     pub public_key: String,
-    owner_id: Option<i64>,
+    pub owner_id: Option<i64>,
     last_athena_ping: Option<i64>,
 }
 
@@ -73,6 +73,10 @@ pub async fn find(db: &SqlitePool, dongle_id: &str) -> Result<Option<Device>> {
     .fetch_optional(db)
     .await
     .map_err(anyhow::Error::from)?)
+}
+
+pub async fn owned(db: &SqlitePool, dongle_id: &str, user_id: i64) -> Result<bool> {
+    Ok(find(db, dongle_id).await?.and_then(|d| d.owner_id) == Some(user_id))
 }
 
 impl Device {

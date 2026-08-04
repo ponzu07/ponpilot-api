@@ -10,11 +10,34 @@ pub struct Config {
     pub jwt_secret: String,
     superusers: HashSet<String>,
     pub github: Option<OAuthProvider>,
+    pub storage: Option<Storage>,
 }
 
 pub struct OAuthProvider {
     pub client_id: String,
     pub client_secret: String,
+}
+
+pub struct Storage {
+    pub endpoint: String,
+    pub bucket: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub region: String,
+}
+
+impl Storage {
+    fn from_env() -> Option<Self> {
+        Some(Self {
+            endpoint: optional("STORAGE_ENDPOINT")?
+                .trim_end_matches('/')
+                .to_string(),
+            bucket: optional("STORAGE_BUCKET")?,
+            access_key: optional("STORAGE_ACCESS_KEY")?,
+            secret_key: optional("STORAGE_SECRET_KEY")?,
+            region: optional("STORAGE_REGION").unwrap_or_else(|| "us-east-1".into()),
+        })
+    }
 }
 
 impl Config {
@@ -44,6 +67,7 @@ impl Config {
                 }),
                 _ => None,
             },
+            storage: Storage::from_env(),
         })
     }
 }
