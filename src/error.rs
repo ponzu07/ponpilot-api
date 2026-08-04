@@ -7,19 +7,29 @@ use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("unknown provider: {0}")]
-    UnknownProvider(String),
-    #[error("{0} auth is not configured")]
-    ProviderDisabled(&'static str),
+    #[error("unknown provider")]
+    UnknownProvider,
+    #[error("provider is not configured")]
+    ProviderDisabled,
     #[error("invalid or expired state")]
     InvalidState,
+    #[error("could not exchange authorization code")]
+    ExchangeFailed,
+    #[error("internal error")]
+    Internal(#[from] anyhow::Error),
 }
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
-            Error::UnknownProvider(_) => StatusCode::NOT_FOUND,
-            Error::ProviderDisabled(_) | Error::InvalidState => StatusCode::BAD_REQUEST,
+            Error::UnknownProvider => StatusCode::NOT_FOUND,
+            Error::ProviderDisabled | Error::InvalidState | Error::ExchangeFailed => {
+                StatusCode::BAD_REQUEST
+            }
+            Error::Internal(ref e) => {
+                tracing::error!("{e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
