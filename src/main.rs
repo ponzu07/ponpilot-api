@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod device;
 mod error;
+mod qlog;
 mod route;
 mod sigv4;
 mod token;
@@ -65,7 +66,10 @@ async fn main() -> Result<()> {
             get(route::routes_segments),
         )
         .route("/v1/route/{route_name}/files", get(route::files))
-        .route("/v1/segments/{d}/{route}/{seg}/{file}", get(route::empty))
+        .route(
+            "/v1/segments/{tok}/{d}/{route}/{seg}/{file}",
+            get(route::segment_file),
+        )
         .route("/ws/v2/{dongle_id}", get(athena::ws))
         .route("/v2/auth/", post(auth::exchange))
         .route("/v2/auth/{provider}/", get(auth::start))

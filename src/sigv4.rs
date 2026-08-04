@@ -3,13 +3,13 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Storage;
 
-fn hmac(key: &[u8], msg: &str) -> [u8; 32] {
+pub fn hmac(key: &[u8], msg: &str) -> [u8; 32] {
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
     m.update(msg.as_bytes());
     m.finalize().into_bytes().into()
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
