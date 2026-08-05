@@ -27,7 +27,6 @@ struct Sub<'a> {
 }
 
 impl<'a> Sub<'a> {
-
     fn at(seg: &'a [u8], word: usize) -> Option<Self> {
         let p = u64::from_le_bytes(seg.get(word * 8..word * 8 + 8)?.try_into().ok()?);
         if p & 3 != 0 {

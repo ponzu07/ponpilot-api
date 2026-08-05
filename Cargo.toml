@@ -10,10 +10,10 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "smallvec", "tracing-log"] }
 anyhow = "1"
 thiserror = "2"
-rand = "0.10.2"
+rand = "0.9"
 url = "2.5.8"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs", "use_pem"], default-features = false }

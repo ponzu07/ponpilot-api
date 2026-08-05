@@ -21,6 +21,7 @@ use axum::{
 use config::Config;
 use sqlx::SqlitePool;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
 struct AppState {
@@ -31,11 +32,13 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ponpilot_api=info,tower_http=info".into()),
-        )
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse::<Targets>().ok())
+        .unwrap_or_else(|| "ponpilot_api=info,tower_http=info".parse().unwrap());
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
         .init();
 
     let config = Config::from_env()?;
