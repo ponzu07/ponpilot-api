@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::SqlitePool;
 
 use crate::{
     AppState,
@@ -107,19 +108,57 @@ pub async fn upload_url(
 }
 
 /// connect は `route.url` にパスを連結する（`cached.js:307`）のでクエリ署名は使えない。
-fn segment_token(secret: &str, dongle_id: &str, route_name: &str, exp: i64) -> String {
+fn segment_token(
+    secret: &str,
+    dongle_id: &str,
+    route_name: &str,
+    exp: i64,
+    shared: bool,
+) -> String {
+    let scope = if shared { "pubsegurl:" } else { "segurl:" };
     let sig = sigv4::hex(&sigv4::hmac(
         secret.as_bytes(),
-        &format!("segurl:{dongle_id}/{route_name}/{exp}"),
+        &format!("{scope}{dongle_id}/{route_name}/{exp}"),
     ));
     format!("{exp}-{}", &sig[..16])
 }
 
-fn verify_segment_token(secret: &str, token: &str, dongle: &str, route: &str) -> Result<()> {
+fn token_matches(secret: &str, token: &str, dongle: &str, route: &str, shared: bool) -> bool {
     let exp: i64 = token
         .split_once('-')
         .map_or(0, |(e, _)| e.parse().unwrap_or(0));
-    (exp >= now() && segment_token(secret, dongle, route, exp) == token)
+    exp >= now() && segment_token(secret, dongle, route, exp, shared) == token
+}
+
+/// 公開マークは「現オーナーが出したもの」かつ「ルートの所有が割れていない」ときだけ効く。
+async fn public_route(db: &SqlitePool, dongle_id: &str, route_name: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM routes r
+           JOIN devices d ON d.dongle_id = r.dongle_id AND d.owner_id = r.owner_id
+          WHERE r.dongle_id = ?1 AND r.route_name = ?2 AND r.is_public
+            AND NOT EXISTS (SELECT 1 FROM uploads u WHERE u.dongle_id = ?1
+                             AND u.route_name = ?2 AND u.owner_id IS NOT r.owner_id))",
+    )
+    .bind(dongle_id)
+    .bind(route_name)
+    .fetch_one(db)
+    .await
+    .map_err(anyhow::Error::from)?)
+}
+
+/// 公開用トークンは公開が続いている間だけ有効。オーナー用は第4段階から変わらない。
+async fn verify_segment_token(
+    app: &AppState,
+    token: &str,
+    dongle: &str,
+    route: &str,
+) -> Result<()> {
+    let secret = &app.config.jwt_secret;
+    if token_matches(secret, token, dongle, route, false) {
+        return Ok(());
+    }
+    (token_matches(secret, token, dongle, route, true)
+        && public_route(&app.db, dongle, route).await?)
         .then_some(())
         .ok_or(Error::Forbidden)
 }
@@ -305,26 +344,52 @@ pub struct RoutesQuery {
     route_str: Option<String>,
 }
 
+const OWNED_ROUTES: &str =
+    "SELECT route_name, MIN(created_at) * 1000 AS started, GROUP_CONCAT(DISTINCT segment),
+            EXISTS (SELECT 1 FROM routes r WHERE r.dongle_id = ?1
+                     AND r.route_name = uploads.route_name AND r.owner_id = ?6 AND r.is_public
+                     AND NOT EXISTS (SELECT 1 FROM uploads u WHERE u.dongle_id = ?1
+                          AND u.route_name = uploads.route_name AND u.owner_id IS NOT ?6))
+       FROM uploads WHERE dongle_id = ?1 AND owner_id = ?6 GROUP BY route_name
+      HAVING (?2 IS NULL OR MIN(created_at) * 1000 >= ?2)
+         AND (?3 IS NULL OR MIN(created_at) * 1000 <= ?3)
+         AND (?4 IS NULL OR route_name = ?4)
+      ORDER BY started DESC LIMIT ?5";
+
+/// 匿名の走査量を公開ルート数に縛る。素の JOIN だと uploads が外側になるので CROSS JOIN。
+const PUBLIC_ROUTES: &str =
+    "SELECT u.route_name, MIN(u.created_at) * 1000 AS started, GROUP_CONCAT(DISTINCT u.segment), TRUE
+       FROM routes r CROSS JOIN uploads u ON u.dongle_id = ?1 AND u.route_name = r.route_name
+      WHERE r.dongle_id = ?1 AND r.is_public
+        AND EXISTS (SELECT 1 FROM devices d WHERE d.dongle_id = ?1 AND d.owner_id = r.owner_id)
+        AND NOT EXISTS (SELECT 1 FROM uploads x WHERE x.dongle_id = ?1
+             AND x.route_name = r.route_name AND x.owner_id IS NOT r.owner_id)
+      GROUP BY u.route_name
+     HAVING (?2 IS NULL OR MIN(u.created_at) * 1000 >= ?2)
+        AND (?3 IS NULL OR MIN(u.created_at) * 1000 <= ?3)
+        AND (?4 IS NULL OR u.route_name = ?4)
+      ORDER BY started DESC LIMIT ?5";
+
 pub async fn routes_segments(
     State(app): State<AppState>,
     Path(dongle_id): Path<String>,
-    user: CurrentUser,
+    user: Option<CurrentUser>,
     Query(q): Query<RoutesQuery>,
 ) -> Result<Json<Value>> {
-    if !device::owned(&app.db, &dongle_id, user.id).await? {
-        return Ok(Json(json!([])));
+    let viewer = match &user {
+        Some(u) if device::owned(&app.db, &dongle_id, u.id).await? => Some(u.id),
+        _ => None,
+    };
+    if viewer.is_some() {
+        // connect は `[]` を 14 日キャッシュする（`cached.js:337`）ので先にパースする。
+        let _ = tokio::time::timeout(HARVEST_BUDGET, harvest(&app, &dongle_id)).await;
     }
-    // connect は `[]` を 14 日キャッシュする（`cached.js:337`）ので先にパースする。
-    let _ = tokio::time::timeout(HARVEST_BUDGET, harvest(&app, &dongle_id)).await;
 
-    let rows: Vec<(String, i64, String)> = sqlx::query_as(
-        "SELECT route_name, MIN(created_at) * 1000 AS started, GROUP_CONCAT(DISTINCT segment)
-         FROM uploads WHERE dongle_id = ?1 AND owner_id = ?6 GROUP BY route_name
-         HAVING (?2 IS NULL OR MIN(created_at) * 1000 >= ?2)
-            AND (?3 IS NULL OR MIN(created_at) * 1000 <= ?3)
-            AND (?4 IS NULL OR route_name = ?4)
-         ORDER BY started DESC LIMIT ?5",
-    )
+    let mut query = sqlx::query_as(if viewer.is_some() {
+        OWNED_ROUTES
+    } else {
+        PUBLIC_ROUTES
+    })
     .bind(&dongle_id)
     .bind(q.start)
     .bind(q.end)
@@ -334,13 +399,16 @@ pub async fn routes_segments(
             .and_then(|s| s.split_once('|'))
             .map(|(_, log)| log),
     )
-    .bind(q.limit.filter(|n| *n > 0).unwrap_or(100).min(1000))
-    .bind(user.id)
-    .fetch_all(&app.db)
-    .await
-    .map_err(anyhow::Error::from)?;
+    .bind(q.limit.filter(|n| *n > 0).unwrap_or(100).min(1000));
+    if let Some(id) = viewer {
+        query = query.bind(id);
+    }
+    let rows: Vec<(String, i64, String, bool)> = query
+        .fetch_all(&app.db)
+        .await
+        .map_err(anyhow::Error::from)?;
 
-    let names: Vec<&str> = rows.iter().map(|(name, _, _)| name.as_str()).collect();
+    let names: Vec<&str> = rows.iter().map(|(name, _, _, _)| name.as_str()).collect();
     let parsed: Vec<Parsed> = sqlx::query_as(
         "SELECT route_name, segment, start_millis, start_offset, end_offset, distance_m,
                 first_lat, first_lng, last_lat, last_lng
@@ -363,18 +431,25 @@ pub async fn routes_segments(
 
     let routes = rows
         .iter()
-        .map(|(name, started, segments)| {
+        .map(|(name, started, segments, is_public)| {
             let mut segments: Vec<i64> =
                 segments.split(',').filter_map(|s| s.parse().ok()).collect();
             segments.sort_unstable();
 
             let parsed = by_route.get(name.as_str()).map_or(&[][..], Vec::as_slice);
             let (starts, ends) = timeline(&segments, parsed, *started);
-            let tok = segment_token(&app.config.jwt_secret, &dongle_id, name, exp);
+            let tok = segment_token(
+                &app.config.jwt_secret,
+                &dongle_id,
+                name,
+                exp,
+                viewer.is_none(),
+            );
 
             json!({
                 "fullname": format!("{dongle_id}|{name}"),
                 "dongle_id": dongle_id,
+                "is_public": is_public,
                 "url": format!("{}/v1/segments/{tok}/{dongle_id}/{name}", app.config.public_url),
                 "share_exp": exp,
                 "share_sig": &tok[tok.len() - 16..],
@@ -400,9 +475,13 @@ pub async fn routes_segments(
 pub async fn files(
     State(app): State<AppState>,
     Path(route_name): Path<String>,
-    user: CurrentUser,
+    user: Option<CurrentUser>,
 ) -> Result<Json<Value>> {
     let (dongle_id, name) = route_name.split_once('|').ok_or(Error::NotFound)?;
+    // 未ログインで公開リンクを踏んだ閲覧者にも、認証済み非オーナーと同じ空を返す。
+    let Some(user) = user else {
+        return Ok(Json(json!({})));
+    };
     if !device::owned(&app.db, dongle_id, user.id).await? {
         return Ok(Json(json!({})));
     }
@@ -431,6 +510,69 @@ pub async fn files(
             .push(sigv4::presign_url(s, "GET", &key, URL_TTL));
     }
     Ok(Json(json!(out)))
+}
+
+pub async fn stats(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<Value>> {
+    let (routes, meters, millis): (i64, f64, i64) = sqlx::query_as(
+        "SELECT count(DISTINCT s.route_name), coalesce(sum(s.distance_m), 0.0),
+                coalesce(sum(max(s.end_offset - s.start_offset, 0)), 0)
+           FROM devices d LEFT JOIN segments s ON s.dongle_id = d.dongle_id
+            AND EXISTS (SELECT 1 FROM uploads u WHERE u.dongle_id = s.dongle_id
+                         AND u.route_name = s.route_name AND u.owner_id = ?2)
+          WHERE d.dongle_id = ?1 AND d.owner_id = ?2 GROUP BY d.dongle_id",
+    )
+    .bind(&dongle_id)
+    .bind(user.id)
+    .fetch_optional(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    .ok_or(Error::NotFound)?;
+
+    // 単位はマイルと分（`DriveList.jsx:107,128`）。
+    Ok(Json(json!({ "all": {
+        "routes": routes,
+        "distance": meters / METERS_PER_MILE,
+        "minutes": millis as f64 / 60_000.0,
+    }})))
+}
+
+#[derive(Deserialize)]
+pub struct PublicBody {
+    is_public: bool,
+}
+
+pub async fn set_public(
+    State(app): State<AppState>,
+    Path(route_name): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<PublicBody>,
+) -> Result<Json<Value>> {
+    let (dongle_id, name) = route_name.split_once('|').ok_or(Error::NotFound)?;
+    let updated = sqlx::query(
+        "INSERT INTO routes (dongle_id, route_name, owner_id, is_public) SELECT ?1, ?2, ?3, ?4
+          WHERE EXISTS (SELECT 1 FROM uploads u JOIN devices d ON d.dongle_id = u.dongle_id
+                         WHERE u.dongle_id = ?1 AND u.route_name = ?2
+                           AND u.owner_id = ?3 AND d.owner_id = ?3)
+         ON CONFLICT DO UPDATE SET is_public = ?4",
+    )
+    .bind(dongle_id)
+    .bind(name)
+    .bind(user.id)
+    .bind(body.is_public)
+    .execute(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    .rows_affected();
+    if updated == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(Json(
+        json!({ "fullname": route_name, "is_public": body.is_public }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -462,12 +604,7 @@ pub async fn qcamera_m3u8(
     Query(q): Query<StreamQuery>,
 ) -> Result<Response> {
     let (dongle_id, name) = route_name.split_once('|').ok_or(Error::NotFound)?;
-    verify_segment_token(
-        &app.config.jwt_secret,
-        &format!("{}-{}", q.exp, q.sig),
-        dongle_id,
-        name,
-    )?;
+    verify_segment_token(&app, &format!("{}-{}", q.exp, q.sig), dongle_id, name).await?;
 
     let rows: Vec<(i64, Option<i64>, Option<i64>, bool)> = sqlx::query_as(
         "SELECT u.segment, s.start_offset, s.end_offset, MAX(u.filename = 'qcamera.ts')
@@ -525,7 +662,7 @@ pub async fn segment_file(
         String,
     )>,
 ) -> Result<Response> {
-    verify_segment_token(&app.config.jwt_secret, &token, &dongle_id, &route_name)?;
+    verify_segment_token(&app, &token, &dongle_id, &route_name).await?;
     let want_coords = match file.as_str() {
         "coords.json" => true,
         "events.json" => false,
@@ -559,8 +696,8 @@ mod tests {
     fn segment_token_binds_route_and_expiry() {
         let (secret, dongle, route) = ("s".repeat(32), "ded1dce02bf7e410", "00000004--0ac3964c96");
         let exp = now() + 3600;
-        let tok = segment_token(&secret, dongle, route, exp);
-        assert!(verify_segment_token(&secret, &tok, dongle, route).is_ok());
+        let tok = segment_token(&secret, dongle, route, exp, false);
+        assert!(token_matches(&secret, &tok, dongle, route, false));
 
         let url = format!("https://h/v1/segments/{tok}/{dongle}/{route}/1/events.json");
         assert!(!url.contains(['?', '#', '&']), "{url}");
@@ -573,18 +710,21 @@ mod tests {
             (tok.as_str(), dongle, "00000005--0ac3964c96"),
             ("deadbeef", dongle, route),
             (
-                segment_token(&secret, dongle, route, now() - 1).as_str(),
+                segment_token(&secret, dongle, route, now() - 1, false).as_str(),
                 dongle,
                 route,
             ),
         ] {
-            assert!(
-                verify_segment_token(&secret, t, d, r).is_err(),
-                "{t} {d} {r}"
-            );
+            assert!(!token_matches(&secret, t, d, r, false), "{t} {d} {r}");
         }
-        let other = segment_token(&"x".repeat(32), dongle, route, exp);
-        assert!(verify_segment_token(&secret, &other, dongle, route).is_err());
+        let other = segment_token(&"x".repeat(32), dongle, route, exp, false);
+        assert!(!token_matches(&secret, &other, dongle, route, false));
+
+        // 公開用トークンはオーナー用として通らない（公開取り消し後の再検証に落ちる）。
+        let shared = segment_token(&secret, dongle, route, exp, true);
+        assert_ne!(shared, tok);
+        assert!(!token_matches(&secret, &shared, dongle, route, false));
+        assert!(token_matches(&secret, &shared, dongle, route, true));
     }
 
     #[test]

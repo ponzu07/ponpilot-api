@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{FromRequestParts, State},
+    extract::{FromRequestParts, OptionalFromRequestParts, State},
     http::{header, request::Parts},
 };
 use serde_json::{Value, json};
@@ -38,6 +38,20 @@ impl FromRequestParts<AppState> for CurrentUser {
             identity,
             username,
         })
+    }
+}
+
+impl OptionalFromRequestParts<AppState> for CurrentUser {
+    type Rejection = Error;
+
+    /// トークンが無いときだけ匿名。壊れたトークンは 401 のまま。
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Option<Self>> {
+        if !parts.headers.contains_key(header::AUTHORIZATION) {
+            return Ok(None);
+        }
+        <Self as FromRequestParts<AppState>>::from_request_parts(parts, app)
+            .await
+            .map(Some)
     }
 }
 

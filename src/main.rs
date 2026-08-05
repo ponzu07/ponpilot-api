@@ -17,7 +17,7 @@ use anyhow::Result;
 use axum::{
     Router,
     http::{HeaderValue, Method, header},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use config::Config;
 use sqlx::SqlitePool;
@@ -70,6 +70,8 @@ async fn main() -> Result<()> {
             get(device::get).delete(device::remove),
         )
         .route("/v1.1/devices/{dongle_id}/", get(device::get))
+        .route("/v1.1/devices/{dongle_id}/stats", get(route::stats))
+        .route("/v1/devices/{dongle_id}/", patch(device::set_alias))
         .route("/v1/devices/{dongle_id}/unpair", post(device::unpair))
         .route("/v2/pilotpair/", post(device::pilotpair))
         .route("/v1.4/{dongle_id}/upload_url/", get(route::upload_url))
@@ -77,6 +79,7 @@ async fn main() -> Result<()> {
             "/v1/devices/{dongle_id}/routes_segments",
             get(route::routes_segments),
         )
+        .route("/v1/route/{route_name}/", patch(route::set_public))
         .route("/v1/route/{route_name}/files", get(route::files))
         .route(
             "/v1/route/{route_name}/qcamera.m3u8",

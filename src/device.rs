@@ -63,11 +63,12 @@ pub struct Device {
     pub owner_id: Option<i64>,
     last_athena_ping: Option<i64>,
     openpilot_version: Option<String>,
+    alias: Option<String>,
 }
 
 pub async fn find(db: &SqlitePool, dongle_id: &str) -> Result<Option<Device>> {
     Ok(sqlx::query_as(
-        "SELECT dongle_id, public_key, owner_id, last_athena_ping, openpilot_version
+        "SELECT dongle_id, public_key, owner_id, last_athena_ping, openpilot_version, alias
          FROM devices WHERE dongle_id = ?1",
     )
     .bind(dongle_id)
@@ -84,7 +85,7 @@ impl Device {
     fn json(&self, viewer: Option<i64>) -> Value {
         json!({
             "dongle_id": self.dongle_id,
-            "alias": null,
+            "alias": self.alias,
             // 欠けると connect が "comma undefined" と表示する（`utils/index.js:53-59`）。
             "device_type": "unknown",
             "is_owner": viewer.is_some() && viewer == self.owner_id,
@@ -100,7 +101,7 @@ impl Device {
 
 pub async fn list(State(app): State<AppState>, user: CurrentUser) -> Result<Json<Value>> {
     let rows: Vec<Device> = sqlx::query_as(
-        "SELECT dongle_id, public_key, owner_id, last_athena_ping, openpilot_version
+        "SELECT dongle_id, public_key, owner_id, last_athena_ping, openpilot_version, alias
          FROM devices WHERE owner_id = ?1",
     )
     .bind(user.id)
@@ -146,6 +147,31 @@ pub async fn get(
 }
 
 #[derive(Deserialize)]
+pub struct AliasBody {
+    alias: String,
+}
+
+pub async fn set_alias(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<AliasBody>,
+) -> Result<Json<Value>> {
+    let device: Device = sqlx::query_as(
+        "UPDATE devices SET alias = ?3 WHERE dongle_id = ?1 AND owner_id = ?2
+         RETURNING dongle_id, public_key, owner_id, last_athena_ping, openpilot_version, alias",
+    )
+    .bind(&dongle_id)
+    .bind(user.id)
+    .bind(&body.alias)
+    .fetch_optional(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    .ok_or(Error::NotFound)?;
+    Ok(Json(device.json(Some(user.id))))
+}
+
+#[derive(Deserialize)]
 pub struct PairForm {
     pair_token: String,
 }
@@ -184,14 +210,15 @@ pub async fn unpair(
     Path(dongle_id): Path<String>,
     user: CurrentUser,
 ) -> Result<Json<Value>> {
-    let updated =
-        sqlx::query("UPDATE devices SET owner_id = NULL WHERE dongle_id = ?1 AND owner_id = ?2")
-            .bind(&dongle_id)
-            .bind(user.id)
-            .execute(&app.db)
-            .await
-            .map_err(anyhow::Error::from)?
-            .rows_affected();
+    let updated = sqlx::query(
+        "UPDATE devices SET owner_id = NULL, alias = NULL WHERE dongle_id = ?1 AND owner_id = ?2",
+    )
+    .bind(&dongle_id)
+    .bind(user.id)
+    .execute(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    .rows_affected();
     if updated == 0 {
         return Err(Error::NotFound);
     }
