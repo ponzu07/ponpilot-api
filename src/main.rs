@@ -73,6 +73,10 @@ async fn main() -> Result<()> {
         )
         .route("/v1/route/{route_name}/files", get(route::files))
         .route(
+            "/v1/route/{route_name}/qcamera.m3u8",
+            get(route::qcamera_m3u8),
+        )
+        .route(
             "/v1/segments/{tok}/{d}/{route}/{seg}/{file}",
             get(route::segment_file),
         )

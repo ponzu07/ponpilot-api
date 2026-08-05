@@ -123,7 +123,7 @@ fn verify_segment_token(secret: &str, token: &str, dongle: &str, route: &str) ->
         .ok_or(Error::Forbidden)
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Default)]
 struct Parsed {
     route_name: String,
     segment: i64,
@@ -135,6 +135,31 @@ struct Parsed {
     first_lng: Option<f64>,
     last_lat: Option<f64>,
     last_lng: Option<f64>,
+}
+
+fn timeline(segments: &[i64], parsed: &[&Parsed], started: i64) -> (Vec<i64>, Vec<i64>) {
+    let at = |n: i64| parsed.iter().find(|p| p.segment == n);
+    let origin = parsed
+        .first()
+        .map_or(started, |p| p.start_millis - p.segment * SEGMENT_MILLIS);
+    let starts: Vec<i64> = segments
+        .iter()
+        .map(|n| {
+            at(*n).map_or(origin + n * SEGMENT_MILLIS, |p| {
+                p.start_millis + p.start_offset
+            })
+        })
+        .collect();
+    let ends: Vec<i64> = segments
+        .iter()
+        .zip(&starts)
+        .map(|(n, t)| {
+            at(*n)
+                .filter(|p| p.end_offset > 0)
+                .map_or(t + SEGMENT_MILLIS, |p| p.start_millis + p.end_offset)
+        })
+        .collect();
+    (starts, ends)
 }
 
 async fn harvest(app: &AppState, dongle_id: &str) {
@@ -342,34 +367,18 @@ pub async fn routes_segments(
             segments.sort_unstable();
 
             let parsed = by_route.get(name.as_str()).map_or(&[][..], Vec::as_slice);
-            let at = |n: i64| parsed.iter().find(|p| p.segment == n);
-            let origin = parsed.first().map_or(*started, |p| p.start_millis);
-            let starts: Vec<i64> = segments
-                .iter()
-                .map(|n| origin + at(*n).map_or(n * SEGMENT_MILLIS, |p| p.start_offset))
-                .collect();
-            // end_offset が 0 のままだと connect の duration が負になる。
-            let ends: Vec<i64> = segments
-                .iter()
-                .zip(&starts)
-                .map(|(n, t)| {
-                    at(*n)
-                        .filter(|p| p.end_offset > 0)
-                        .map_or(t + SEGMENT_MILLIS, |p| origin + p.end_offset)
-                })
-                .collect();
+            let (starts, ends) = timeline(&segments, parsed, *started);
+            let tok = segment_token(&app.config.jwt_secret, &dongle_id, name, exp);
 
             json!({
                 "fullname": format!("{dongle_id}|{name}"),
                 "dongle_id": dongle_id,
-                "url": format!(
-                    "{}/v1/segments/{}/{dongle_id}/{name}",
-                    app.config.public_url,
-                    segment_token(&app.config.jwt_secret, &dongle_id, name, exp),
-                ),
+                "url": format!("{}/v1/segments/{tok}/{dongle_id}/{name}", app.config.public_url),
+                "share_exp": exp,
+                "share_sig": &tok[tok.len() - 16..],
                 // 単位はマイル。未パースでも数値でないと `toFixed` が落ちる。
                 "distance": parsed.iter().fold(0.0, |m, p| m + p.distance_m) / METERS_PER_MILE,
-                "create_time": starts.first().copied().unwrap_or(origin) / 1000,
+                "create_time": starts.first().copied().unwrap_or(*started) / 1000,
                 "maxqlog": segments.last(),
                 "start_time_utc_millis": starts.first(),
                 "end_time_utc_millis": ends.last(),
@@ -419,6 +428,88 @@ pub async fn files(
             .push(sigv4::presign_url(s, "GET", &key, URL_TTL));
     }
     Ok(Json(json!(out)))
+}
+
+#[derive(Deserialize)]
+pub struct StreamQuery {
+    exp: String,
+    sig: String,
+}
+
+/// `#EXT-X-ENDLIST` が無いと hls.js が LIVE 扱いして `video.duration` が `Infinity` になる。
+fn playlist(items: &[(f64, bool, String)]) -> String {
+    let target = items.iter().fold(0.0f64, |m, (d, _, _)| m.max(*d)).ceil() as i64;
+    let mut out = format!(
+        "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+         #EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n"
+    );
+    for (d, present, url) in items {
+        if !present {
+            out.push_str("#EXT-X-GAP\n");
+        }
+        out.push_str(&format!("#EXTINF:{d:.3},\n{url}\n"));
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
+pub async fn qcamera_m3u8(
+    State(app): State<AppState>,
+    Path(route_name): Path<String>,
+    Query(q): Query<StreamQuery>,
+) -> Result<Response> {
+    let (dongle_id, name) = route_name.split_once('|').ok_or(Error::NotFound)?;
+    verify_segment_token(
+        &app.config.jwt_secret,
+        &format!("{}-{}", q.exp, q.sig),
+        dongle_id,
+        name,
+    )?;
+
+    let rows: Vec<(i64, Option<i64>, Option<i64>, bool)> = sqlx::query_as(
+        "SELECT u.segment, s.start_offset, s.end_offset, MAX(u.filename = 'qcamera.ts')
+           FROM uploads u LEFT JOIN segments s
+             ON s.dongle_id = u.dongle_id AND s.route_name = u.route_name
+            AND s.segment = u.segment
+          WHERE u.dongle_id = ?1 AND u.route_name = ?2
+          GROUP BY u.segment ORDER BY u.segment",
+    )
+    .bind(dongle_id)
+    .bind(name)
+    .fetch_all(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?;
+    if !rows.iter().any(|(_, _, _, qcam)| *qcam) {
+        return Err(Error::NotFound);
+    }
+
+    let s = storage(&app)?;
+    // 欠落セグメントを飛ばすとプレイリスト時刻が connect のルートオフセットと恒久的にずれる。
+    let items: Vec<(f64, bool, String)> = (rows[0].0..=rows[rows.len() - 1].0)
+        .map(|n| {
+            let row = rows.iter().find(|r| r.0 == n);
+            // qcamera.ts は encoderd が 1200 フレームで切るので必ず 60 秒以下。
+            let d = match row.map(|r| (r.1, r.2)) {
+                Some((Some(a), Some(b))) if b > a => ((b - a) as f64 / 1000.0).min(60.0),
+                _ => 60.0,
+            };
+            let key = format!("{dongle_id}/{name}/{n}/qcamera.ts");
+            (
+                d,
+                row.is_some_and(|r| r.3),
+                sigv4::presign_url(s, "GET", &key, URL_TTL),
+            )
+        })
+        .collect();
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        playlist(&items),
+    )
+        .into_response())
 }
 
 pub async fn segment_file(
@@ -471,6 +562,9 @@ mod tests {
         let url = format!("https://h/v1/segments/{tok}/{dongle}/{route}/1/events.json");
         assert!(!url.contains(['?', '#', '&']), "{url}");
 
+        let (e, s) = (exp, &tok[tok.len() - 16..]);
+        assert_eq!(format!("{e}-{s}"), tok, "share_exp と share_sig の再連結");
+
         for (t, d, r) in [
             (tok.as_str(), "other_dongle_id", route),
             (tok.as_str(), dongle, "00000005--0ac3964c96"),
@@ -488,6 +582,63 @@ mod tests {
         }
         let other = segment_token(&"x".repeat(32), dongle, route, exp);
         assert!(verify_segment_token(&secret, &other, dongle, route).is_err());
+    }
+
+    #[test]
+    fn playlist_is_a_finite_vod() {
+        let url0 = "https://s3/a/0/qcamera.ts?X-Amz-Date=x&X-Amz-Signature=y".to_string();
+        let items = [
+            (60.0, true, url0.clone()),
+            (32.4, true, "https://s3/1".into()),
+        ];
+        let m = playlist(&items);
+
+        assert!(m.starts_with("#EXTM3U\n"), "{m}");
+        assert!(m.ends_with("#EXT-X-ENDLIST\n"), "{m}");
+        assert!(m.contains("#EXT-X-TARGETDURATION:60\n"), "{m}");
+        assert_eq!(m.matches("#EXTINF:").count(), 2);
+        assert!(m.contains("#EXTINF:32.400,\n"), "{m}");
+        assert!(
+            m.contains(&format!("\n{url0}\n")),
+            "URI 行が verbatim でない"
+        );
+        assert!(!m.contains("#EXT-X-GAP"), "全部そろっているので不要: {m}");
+
+        let gap = playlist(&[(60.0, true, "a".into()), (60.0, false, "b".into())]);
+        assert_eq!(
+            gap.matches("#EXT-X-GAP\n#EXTINF:60.000,\nb\n").count(),
+            1,
+            "{gap}"
+        );
+    }
+
+    #[test]
+    fn timeline_uses_per_segment_wall_clock() {
+        let seg = |segment, start_millis, end_offset| Parsed {
+            segment,
+            start_millis,
+            end_offset,
+            ..Default::default()
+        };
+
+        let (a, b) = (seg(0, 1_000_000, 61_428), seg(1, 1_061_500, 60_000));
+        let (starts, ends) = timeline(&[0, 1], &[&a, &b], 0);
+        assert_eq!(
+            starts,
+            [1_000_000, 1_061_500],
+            "61428 刻みになってはいけない"
+        );
+        assert_eq!(ends, [1_061_428, 1_121_500]);
+
+        let (starts, _) = timeline(&[0, 1, 2], &[&a], 0);
+        assert_eq!(starts[2], 1_120_000, "未パースは origin + n*60000");
+
+        let c = seg(3, 1_180_000, 0);
+        let (starts, ends) = timeline(&[0, 3], &[&c], 0);
+        assert_eq!(starts, [1_000_000, 1_180_000], "origin が 3 分前に戻る");
+        assert_eq!(ends[1], 1_240_000, "end_offset 0 は 60 秒に落ちる");
+
+        assert_eq!(timeline(&[0], &[], 42_000).0, [42_000], "started に落ちる");
     }
 
     #[test]
