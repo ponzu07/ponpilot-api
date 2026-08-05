@@ -86,13 +86,14 @@ pub async fn upload_url(
     let key = match segment_of(path) {
         Some((route, seg, file)) => {
             sqlx::query(
-                "INSERT OR IGNORE INTO uploads (dongle_id, route_name, segment, filename, created_at)
-                 VALUES (?1, ?2, ?3, ?4, unixepoch())",
+                "INSERT OR IGNORE INTO uploads (dongle_id, route_name, segment, filename, created_at, owner_id)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch(), ?5)",
             )
             .bind(&dongle_id)
             .bind(route)
             .bind(seg)
             .bind(file)
+            .bind(device.owner_id)
             .execute(&app.db)
             .await
             .map_err(anyhow::Error::from)?;
@@ -318,7 +319,7 @@ pub async fn routes_segments(
 
     let rows: Vec<(String, i64, String)> = sqlx::query_as(
         "SELECT route_name, MIN(created_at) * 1000 AS started, GROUP_CONCAT(DISTINCT segment)
-         FROM uploads WHERE dongle_id = ?1 GROUP BY route_name
+         FROM uploads WHERE dongle_id = ?1 AND owner_id = ?6 GROUP BY route_name
          HAVING (?2 IS NULL OR MIN(created_at) * 1000 >= ?2)
             AND (?3 IS NULL OR MIN(created_at) * 1000 <= ?3)
             AND (?4 IS NULL OR route_name = ?4)
@@ -334,6 +335,7 @@ pub async fn routes_segments(
             .map(|(_, log)| log),
     )
     .bind(q.limit.filter(|n| *n > 0).unwrap_or(100).min(1000))
+    .bind(user.id)
     .fetch_all(&app.db)
     .await
     .map_err(anyhow::Error::from)?;
@@ -406,10 +408,11 @@ pub async fn files(
     }
     let rows: Vec<(i64, String)> = sqlx::query_as(
         "SELECT segment, filename FROM uploads
-         WHERE dongle_id = ?1 AND route_name = ?2 ORDER BY segment",
+         WHERE dongle_id = ?1 AND route_name = ?2 AND owner_id = ?3 ORDER BY segment",
     )
     .bind(dongle_id)
     .bind(name)
+    .bind(user.id)
     .fetch_all(&app.db)
     .await
     .map_err(anyhow::Error::from)?;

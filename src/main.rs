@@ -30,6 +30,7 @@ struct AppState {
     db: SqlitePool,
     http: reqwest::Client,
     peers: rpc::Peers,
+    tofu: athena::Tofu,
 }
 
 #[tokio::main]
@@ -57,14 +58,19 @@ async fn main() -> Result<()> {
             .build()?,
         config: Arc::new(config),
         peers: Default::default(),
+        tofu: Arc::new(tokio::sync::Semaphore::new(athena::MAX_TOFU)),
     };
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/me/", get(user::me))
         .route("/v1/me/devices/", get(device::list))
-        .route("/v1.1/devices/{dongle_id}", get(device::get))
+        .route(
+            "/v1.1/devices/{dongle_id}",
+            get(device::get).delete(device::remove),
+        )
         .route("/v1.1/devices/{dongle_id}/", get(device::get))
+        .route("/v1/devices/{dongle_id}/unpair", post(device::unpair))
         .route("/v2/pilotpair/", post(device::pilotpair))
         .route("/v1.4/{dongle_id}/upload_url/", get(route::upload_url))
         .route(

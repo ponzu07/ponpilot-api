@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     extract::{
@@ -9,7 +9,7 @@ use axum::{
     response::Response,
 };
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::{
     AppState, device,
@@ -22,6 +22,10 @@ const TOFU_TIMEOUT: Duration = Duration::from_secs(20);
 /// 未認証のまま TOFU 中のクライアントに 64MiB（tungstenite 既定）を確保させない。
 const MAX_MESSAGE: usize = 1 << 20;
 const MAX_RESPONSE: usize = 16 << 20;
+pub const MAX_TOFU: usize = 64;
+const MAX_DEVICES: i64 = 1000;
+
+pub type Tofu = Arc<Semaphore>;
 
 pub async fn ws(
     State(app): State<AppState>,
@@ -48,7 +52,13 @@ pub async fn ws(
             device::verify(&d.public_key, &jwt)?;
             None
         }
-        None => Some(jwt),
+        None => Some((
+            jwt,
+            app.tofu
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Error::TooManyRequests)?,
+        )),
     };
     Ok(upgrade
         .max_message_size(if tofu.is_some() {
@@ -59,20 +69,31 @@ pub async fn ws(
         .on_upgrade(move |s| pump(s, app, dongle_id, tofu)))
 }
 
-async fn pump(mut socket: WebSocket, app: AppState, dongle_id: String, tofu: Option<String>) {
-    if let Some(jwt) = tofu {
+async fn pump(
+    mut socket: WebSocket,
+    app: AppState,
+    dongle_id: String,
+    tofu: Option<(String, OwnedSemaphorePermit)>,
+) {
+    if let Some((jwt, slot)) = tofu {
         // 衝突 = 他の接続が先に登録した。その鍵で検証していないので ping ループに入れない。
         let registered = match trust_on_first_use(&mut socket, &dongle_id, &jwt).await {
-            Some(pem) => sqlx::query("INSERT INTO devices (dongle_id, public_key) VALUES (?1, ?2)")
-                .bind(&dongle_id)
-                .bind(&pem)
-                .execute(&app.db)
-                .await
-                .is_ok(),
+            Some(pem) => sqlx::query(
+                "INSERT INTO devices (dongle_id, public_key)
+                 SELECT ?1, ?2 WHERE (SELECT count(*) FROM devices) < ?3",
+            )
+            .bind(&dongle_id)
+            .bind(&pem)
+            .bind(MAX_DEVICES)
+            .execute(&app.db)
+            .await
+            .map(|r| r.rows_affected() == 1)
+            .unwrap_or(false),
             None => false,
         };
         if !registered {
-            // 即閉じると上記のホットループになる。
+            // 即閉じると上記のホットループになる。ペナルティ中は枠を返す。
+            drop(slot);
             tokio::time::sleep(TOFU_TIMEOUT).await;
             return;
         }

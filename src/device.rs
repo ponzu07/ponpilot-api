@@ -179,6 +179,46 @@ pub async fn pilotpair(
     Ok(Json(json!({ "dongle_id": dongle_id })))
 }
 
+pub async fn unpair(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<Value>> {
+    let updated =
+        sqlx::query("UPDATE devices SET owner_id = NULL WHERE dongle_id = ?1 AND owner_id = ?2")
+            .bind(&dongle_id)
+            .bind(user.id)
+            .execute(&app.db)
+            .await
+            .map_err(anyhow::Error::from)?
+            .rows_affected();
+    if updated == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(Json(json!({ "success": 1 })))
+}
+
+pub async fn remove(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<Value>> {
+    if !app.config.is_superuser(&user.identity) {
+        return Err(Error::NotFound);
+    }
+    let deleted = sqlx::query("DELETE FROM devices WHERE dongle_id = ?1")
+        .bind(&dongle_id)
+        .execute(&app.db)
+        .await
+        .map_err(anyhow::Error::from)?
+        .rows_affected();
+    if deleted == 0 {
+        return Err(Error::NotFound);
+    }
+    tracing::warn!("deleted device {dongle_id} by {}", user.identity);
+    Ok(Json(json!({ "success": 1 })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +229,68 @@ mod tests {
     const EC_B: &str = include_str!("../tests/keys/ec_b.pem");
     const RSA: &str = include_str!("../tests/keys/rsa.pem");
     const RSA_PUB: &str = include_str!("../tests/keys/rsa.pub.pem");
+
+    #[tokio::test]
+    async fn delete_cascades_children() {
+        let p =
+            std::env::temp_dir().join(format!("ponpilot-{}-delete.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let db = crate::db::connect(&p.to_string_lossy()).await.unwrap();
+        let a = crate::db::upsert_user(&db, "github_1", "a").await.unwrap();
+        sqlx::query("INSERT INTO devices (dongle_id, public_key, owner_id) VALUES ('1d3dc3e03047b0c7', 'pem', ?1)")
+            .bind(a)
+            .execute(&db)
+            .await
+            .unwrap();
+        for seg in 0..2 {
+            sqlx::query("INSERT INTO uploads (dongle_id, route_name, segment, filename, created_at, owner_id) VALUES ('1d3dc3e03047b0c7', 'r', ?1, 'f', 0, ?2)")
+                .bind(seg)
+                .bind(a)
+                .execute(&db)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO segments (dongle_id, route_name, segment, claimed_at) VALUES ('1d3dc3e03047b0c7', 'r', ?1, 0)")
+                .bind(seg)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let n = sqlx::query("DELETE FROM devices WHERE dongle_id = ?1")
+            .bind("beefbeefbeefbeef")
+            .execute(&db)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 0, "存在しない dongle_id は 0 行＝404");
+
+        let n = sqlx::query("DELETE FROM devices WHERE dongle_id = ?1")
+            .bind("1d3dc3e03047b0c7")
+            .execute(&db)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1);
+        let left: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM uploads) + (SELECT count(*) FROM segments)",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(left, 0, "CASCADE が効いている");
+        let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(users, 1, "ユーザーは残す");
+
+        let orphan = sqlx::query(
+            "INSERT INTO uploads (dongle_id, route_name, segment, filename, created_at)
+             VALUES ('1d3dc3e03047b0c7', 'r', 0, 'f', 0)",
+        )
+        .execute(&db)
+        .await;
+        assert!(orphan.is_err(), "親のない子行は FK で弾かれる");
+    }
 
     fn sign(alg: Algorithm, pem: &str, claims: Value) -> String {
         let key = match alg {
