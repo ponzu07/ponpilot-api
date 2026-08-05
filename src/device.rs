@@ -62,11 +62,12 @@ pub struct Device {
     pub public_key: String,
     pub owner_id: Option<i64>,
     last_athena_ping: Option<i64>,
+    openpilot_version: Option<String>,
 }
 
 pub async fn find(db: &SqlitePool, dongle_id: &str) -> Result<Option<Device>> {
     Ok(sqlx::query_as(
-        "SELECT dongle_id, public_key, owner_id, last_athena_ping
+        "SELECT dongle_id, public_key, owner_id, last_athena_ping, openpilot_version
          FROM devices WHERE dongle_id = ?1",
     )
     .bind(dongle_id)
@@ -92,13 +93,14 @@ impl Device {
             "prime_type": 0,
             "is_paired": self.owner_id.is_some(),
             "last_athena_ping": self.last_athena_ping,
+            "openpilot_version": self.openpilot_version,
         })
     }
 }
 
 pub async fn list(State(app): State<AppState>, user: CurrentUser) -> Result<Json<Value>> {
     let rows: Vec<Device> = sqlx::query_as(
-        "SELECT dongle_id, public_key, owner_id, last_athena_ping
+        "SELECT dongle_id, public_key, owner_id, last_athena_ping, openpilot_version
          FROM devices WHERE owner_id = ?1",
     )
     .bind(user.id)

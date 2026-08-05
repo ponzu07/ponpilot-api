@@ -6,6 +6,7 @@ mod device;
 mod error;
 mod qlog;
 mod route;
+mod rpc;
 mod sigv4;
 mod token;
 mod user;
@@ -28,6 +29,7 @@ struct AppState {
     config: Arc<Config>,
     db: SqlitePool,
     http: reqwest::Client,
+    peers: rpc::Peers,
 }
 
 #[tokio::main]
@@ -54,6 +56,7 @@ async fn main() -> Result<()> {
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
         config: Arc::new(config),
+        peers: Default::default(),
     };
 
     let app = Router::new()
@@ -77,6 +80,7 @@ async fn main() -> Result<()> {
         .route("/v2/auth/", post(auth::exchange))
         .route("/v2/auth/{provider}/", get(auth::start))
         .route("/v2/auth/{provider}/redirect/", get(auth::callback))
+        .route("/{dongle_id}", post(rpc::relay))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

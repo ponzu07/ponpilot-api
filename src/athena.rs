@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use axum::{
     extract::{
@@ -9,6 +9,7 @@ use axum::{
     response::Response,
 };
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     AppState, device,
@@ -20,6 +21,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const TOFU_TIMEOUT: Duration = Duration::from_secs(20);
 /// 未認証のまま TOFU 中のクライアントに 64MiB（tungstenite 既定）を確保させない。
 const MAX_MESSAGE: usize = 1 << 20;
+const MAX_RESPONSE: usize = 16 << 20;
 
 pub async fn ws(
     State(app): State<AppState>,
@@ -49,7 +51,11 @@ pub async fn ws(
         None => Some(jwt),
     };
     Ok(upgrade
-        .max_message_size(MAX_MESSAGE)
+        .max_message_size(if tofu.is_some() {
+            MAX_MESSAGE
+        } else {
+            MAX_RESPONSE
+        })
         .on_upgrade(move |s| pump(s, app, dongle_id, tofu)))
 }
 
@@ -73,13 +79,55 @@ async fn pump(mut socket: WebSocket, app: AppState, dongle_id: String, tofu: Opt
         tracing::info!("registered device {dongle_id}");
     }
 
+    let (tx, mut rx) = mpsc::channel(8);
+    app.peers.lock().unwrap().insert(dongle_id.clone(), tx);
+    let mut pending: HashMap<u64, oneshot::Sender<Value>> = HashMap::new();
+
+    let probe = json!({ "jsonrpc": "2.0", "id": "version", "method": "getVersion" });
+    let _ = socket.send(Message::Text(probe.to_string().into())).await;
+
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let mut alive = true;
+    let mut probed = false;
     loop {
         tokio::select! {
             msg = socket.recv() => match msg {
-                Some(Ok(_)) => alive = true,
+                Some(Ok(msg)) => {
+                    alive = true;
+                    if let Message::Text(t) = msg
+                        && let Ok(resp) = serde_json::from_str::<Value>(&t)
+                    {
+                        match resp["id"].as_u64() {
+                            Some(id) => {
+                                if let Some(reply) = pending.remove(&id) {
+                                    let _ = reply.send(resp);
+                                }
+                            }
+                            None => if !probed
+                                && resp["id"] == "version"
+                                && let Some(v) = resp["result"]["version"].as_str()
+                            {
+                                probed = true;
+                                let _ = sqlx::query("UPDATE devices SET openpilot_version = ?2 WHERE dongle_id = ?1")
+                                    .bind(&dongle_id)
+                                    .bind(v)
+                                    .execute(&app.db)
+                                    .await;
+                            },
+                        }
+                    }
+                }
                 _ => break,
+            },
+            call = rx.recv() => match call {
+                Some((id, text, reply)) => {
+                    pending.retain(|_, r| !r.is_closed());
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                    pending.insert(id, reply);
+                },
+                None => break,
             },
             _ = ping.tick() => {
                 // デバイスは PING に必ず pong を返す（`_core.py:466`）。
@@ -96,6 +144,11 @@ async fn pump(mut socket: WebSocket, app: AppState, dongle_id: String, tofu: Opt
             }
         }
     }
+    drop(rx);
+    app.peers
+        .lock()
+        .unwrap()
+        .retain(|k, v| k != &dongle_id || !v.is_closed());
 }
 
 async fn trust_on_first_use(socket: &mut WebSocket, dongle_id: &str, jwt: &str) -> Option<String> {
