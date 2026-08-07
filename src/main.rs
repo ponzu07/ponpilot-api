@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
         .route("/v1.1/devices/{dongle_id}/stats", get(route::stats))
         .route("/v1/devices/{dongle_id}/", patch(device::set_alias))
         .route("/v1/devices/{dongle_id}/unpair", post(device::unpair))
+        .route("/v2/pilotauth/", post(device::pilotauth))
         .route("/v2/pilotpair/", post(device::pilotpair))
         .route("/v1.4/{dongle_id}/upload_url/", get(route::upload_url))
         .route(

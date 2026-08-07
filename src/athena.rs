@@ -23,7 +23,7 @@ const TOFU_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_MESSAGE: usize = 1 << 20;
 const MAX_RESPONSE: usize = 16 << 20;
 pub const MAX_TOFU: usize = 64;
-const MAX_DEVICES: i64 = 1000;
+pub const MAX_DEVICES: i64 = 1000;
 
 pub type Tofu = Arc<Semaphore>;
 

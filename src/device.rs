@@ -1,6 +1,6 @@
 use axum::{
     Form, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, header},
 };
 use jsonwebtoken::{
@@ -8,6 +8,7 @@ use jsonwebtoken::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::{
@@ -169,6 +170,60 @@ pub async fn set_alias(
     .map_err(anyhow::Error::from)?
     .ok_or(Error::NotFound)?;
     Ok(Json(device.json(Some(user.id))))
+}
+
+#[derive(Deserialize)]
+struct RegisterClaims {
+    register: bool,
+}
+
+#[derive(Deserialize)]
+pub struct RegisterQuery {
+    public_key: String,
+    register_token: String,
+}
+
+pub async fn pilotauth(
+    State(app): State<AppState>,
+    Query(q): Query<RegisterQuery>,
+) -> Result<Json<Value>> {
+    let pem = q.public_key.trim();
+    let (key, alg) = match DecodingKey::from_rsa_pem(pem.as_bytes()) {
+        Ok(k) => (k, Algorithm::RS256),
+        Err(_) => (
+            DecodingKey::from_ec_pem(pem.as_bytes()).map_err(|_| Error::Unauthorized)?,
+            Algorithm::ES256,
+        ),
+    };
+    if !decode::<RegisterClaims>(&q.register_token, &key, &Validation::new(alg))
+        .map_err(|_| Error::Unauthorized)?
+        .claims
+        .register
+    {
+        return Err(Error::Unauthorized);
+    }
+
+    let dongle_id = crate::sigv4::hex(&Sha256::digest(pem.as_bytes()))[..16].to_string();
+    sqlx::query(
+        "INSERT INTO devices (dongle_id, public_key) SELECT ?1, ?2
+          WHERE (SELECT count(*) FROM devices) < ?3
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&dongle_id)
+    .bind(pem)
+    .bind(crate::athena::MAX_DEVICES)
+    .execute(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?;
+
+    let stored = find(&app.db, &dongle_id)
+        .await?
+        .ok_or_else(|| Error::Internal(anyhow::anyhow!("device limit reached")))?;
+    if stored.public_key.trim() != pem {
+        return Err(Error::Unauthorized);
+    }
+    tracing::info!("pilotauth registered {dongle_id}");
+    Ok(Json(json!({ "dongle_id": dongle_id })))
 }
 
 #[derive(Deserialize)]
