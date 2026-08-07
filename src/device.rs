@@ -147,6 +147,28 @@ pub async fn get(
     }
 }
 
+pub async fn firehose_stats(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    let jwt = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("JWT "))
+        .ok_or(Error::Unauthorized)?;
+    let device = find(&app.db, &dongle_id).await?.ok_or(Error::NotFound)?;
+    if verify(&device.public_key, jwt)?.identity != dongle_id {
+        return Err(Error::Unauthorized);
+    }
+    let segments: i64 = sqlx::query_scalar("SELECT count(*) FROM segments WHERE dongle_id = ?1")
+        .bind(&dongle_id)
+        .fetch_one(&app.db)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(Json(json!({ "firehose": segments })))
+}
+
 #[derive(Deserialize)]
 pub struct AliasBody {
     alias: String,

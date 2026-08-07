@@ -124,6 +124,13 @@ async fn pump(
                                     let _ = reply.send(resp);
                                 }
                             }
+                            // 応答しないと1ファイルにつき100秒ブロックし、同じログを再送し続ける。
+                            None if resp["method"] == "forwardLogs" => {
+                                let ack = json!({ "jsonrpc": "2.0", "id": resp["id"], "result": { "success": 1 } });
+                                if socket.send(Message::Text(ack.to_string().into())).await.is_err() {
+                                    break;
+                                }
+                            }
                             None => if !probed
                                 && resp["id"] == "version"
                                 && let Some(v) = resp["result"]["version"].as_str()
