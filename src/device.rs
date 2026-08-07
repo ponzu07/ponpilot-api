@@ -203,7 +203,29 @@ pub async fn pilotauth(
         return Err(Error::Unauthorized);
     }
 
+    if let Some(id) = sqlx::query_scalar::<_, String>(
+        "SELECT dongle_id FROM devices WHERE public_key = ?1 ORDER BY rowid LIMIT 1",
+    )
+    .bind(pem)
+    .fetch_optional(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    {
+        return Ok(Json(json!({ "dongle_id": id })));
+    }
+
     let dongle_id = crate::sigv4::hex(&Sha256::digest(pem.as_bytes()))[..16].to_string();
+    sqlx::query(
+        "DELETE FROM devices WHERE dongle_id = (
+           SELECT dongle_id FROM devices
+            WHERE owner_id IS NULL AND last_athena_ping IS NULL
+              AND (SELECT count(*) FROM devices) >= ?1
+            ORDER BY rowid LIMIT 1)",
+    )
+    .bind(crate::athena::MAX_DEVICES)
+    .execute(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?;
     sqlx::query(
         "INSERT INTO devices (dongle_id, public_key) SELECT ?1, ?2
           WHERE (SELECT count(*) FROM devices) < ?3
@@ -219,7 +241,18 @@ pub async fn pilotauth(
     let stored = find(&app.db, &dongle_id)
         .await?
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("device limit reached")))?;
-    if stored.public_key.trim() != pem {
+    if stored.public_key.trim() != pem
+        && sqlx::query(
+            "UPDATE devices SET public_key = ?2 WHERE dongle_id = ?1 AND owner_id IS NULL",
+        )
+        .bind(&dongle_id)
+        .bind(pem)
+        .execute(&app.db)
+        .await
+        .map_err(anyhow::Error::from)?
+        .rows_affected()
+            == 0
+    {
         return Err(Error::Unauthorized);
     }
     tracing::info!("pilotauth registered {dongle_id}");
