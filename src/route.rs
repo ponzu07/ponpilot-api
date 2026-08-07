@@ -100,7 +100,22 @@ pub async fn upload_url(
             .map_err(anyhow::Error::from)?;
             format!("{dongle_id}/{route}/{seg}/{file}")
         }
-        None => format!("{dongle_id}/{path}"),
+        None => match path.strip_prefix("boot/") {
+            Some(log) => {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO bootlogs (dongle_id, filename, created_at, owner_id)
+                     VALUES (?1, ?2, unixepoch(), ?3)",
+                )
+                .bind(&dongle_id)
+                .bind(log)
+                .bind(device.owner_id)
+                .execute(&app.db)
+                .await
+                .map_err(anyhow::Error::from)?;
+                format!("{dongle_id}/{log}")
+            }
+            None => format!("{dongle_id}/{path}"),
+        },
     };
 
     let url = sigv4::presign_url(s, "PUT", &key, URL_TTL);
@@ -470,6 +485,55 @@ pub async fn routes_segments(
         })
         .collect();
     Ok(Json(Value::Array(routes)))
+}
+
+pub async fn get(
+    state: State<AppState>,
+    Path(route_name): Path<String>,
+    user: Option<CurrentUser>,
+) -> Result<Json<Value>> {
+    let (dongle_id, _) = route_name.split_once('|').ok_or(Error::NotFound)?;
+    let Json(routes) = routes_segments(
+        state,
+        Path(dongle_id.to_string()),
+        user,
+        Query(RoutesQuery {
+            start: None,
+            end: None,
+            limit: Some(1),
+            route_str: Some(route_name.clone()),
+        }),
+    )
+    .await?;
+    routes
+        .as_array()
+        .and_then(|r| r.first())
+        .cloned()
+        .map(Json)
+        .ok_or(Error::NotFound)
+}
+
+pub async fn bootlogs(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<Value>> {
+    let files: Vec<String> = sqlx::query_scalar(
+        "SELECT filename FROM bootlogs WHERE dongle_id = ?1 AND owner_id = ?2 ORDER BY filename",
+    )
+    .bind(&dongle_id)
+    .bind(user.id)
+    .fetch_all(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?;
+
+    let s = storage(&app)?;
+    Ok(Json(json!(
+        files
+            .iter()
+            .map(|f| sigv4::presign_url(s, "GET", &format!("{dongle_id}/{f}"), URL_TTL))
+            .collect::<Vec<_>>()
+    )))
 }
 
 pub async fn files(

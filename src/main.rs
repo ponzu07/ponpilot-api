@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/v1/me", get(user::me))
         .route("/v1/me/", get(user::me))
         .route("/v1/me/devices/", get(device::list))
         .route(
@@ -84,6 +85,8 @@ async fn main() -> Result<()> {
             "/v1/devices/{dongle_id}/routes_segments",
             get(route::routes_segments),
         )
+        .route("/v1/devices/{dongle_id}/bootlogs", get(route::bootlogs))
+        .route("/v1/route/{route_name}", get(route::get))
         .route("/v1/route/{route_name}/", patch(route::set_public))
         .route("/v1/route/{route_name}/files", get(route::files))
         .route(
