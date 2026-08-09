@@ -683,6 +683,10 @@ pub async fn files(
         let kind = match file.as_str() {
             "qcamera.ts" => "qcameras",
             "qlog.zst" => "qlogs",
+            "rlog.zst" => "logs",
+            "fcamera.hevc" => "cameras",
+            "dcamera.hevc" => "dcameras",
+            "ecamera.hevc" => "ecameras",
             _ => continue,
         };
         let key = format!("{dongle_id}/{name}/{seg}/{file}");
