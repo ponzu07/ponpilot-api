@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, Method, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -26,6 +26,7 @@ const HARVEST_LIMIT: i64 = 64;
 const CLAIM_TTL: i64 = 300;
 const MAX_QLOG: usize = 8 << 20;
 const HARVEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+const MAX_UPLOAD_URLS: usize = 256;
 
 fn now() -> i64 {
     std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() as i64
@@ -84,31 +85,44 @@ pub async fn upload_url(
 
     let s = storage(&app)?;
     let path = safe_path(&q.path).ok_or(Error::Forbidden)?;
-    let key = match segment_of(path) {
+    let key = claim_key(&app, &dongle_id, device.owner_id, path).await?;
+
+    let url = sigv4::presign_url(s, "PUT", &key, URL_TTL);
+    Ok(Json(json!({ "url": url, "headers": {} })))
+}
+
+async fn claim_key(
+    app: &AppState,
+    dongle_id: &str,
+    owner_id: Option<i64>,
+    path: &str,
+) -> Result<String> {
+    Ok(match segment_of(path) {
         Some((route, seg, file)) => {
             sqlx::query(
                 "INSERT OR IGNORE INTO uploads (dongle_id, route_name, segment, filename, created_at, owner_id)
                  VALUES (?1, ?2, ?3, ?4, unixepoch(), ?5)",
             )
-            .bind(&dongle_id)
+            .bind(dongle_id)
             .bind(route)
             .bind(seg)
             .bind(file)
-            .bind(device.owner_id)
+            .bind(owner_id)
             .execute(&app.db)
             .await
             .map_err(anyhow::Error::from)?;
             format!("{dongle_id}/{route}/{seg}/{file}")
         }
+
         None => match path.strip_prefix("boot/") {
             Some(log) => {
                 sqlx::query(
                     "INSERT OR IGNORE INTO bootlogs (dongle_id, filename, created_at, owner_id)
                      VALUES (?1, ?2, unixepoch(), ?3)",
                 )
-                .bind(&dongle_id)
+                .bind(dongle_id)
                 .bind(log)
-                .bind(device.owner_id)
+                .bind(owner_id)
                 .execute(&app.db)
                 .await
                 .map_err(anyhow::Error::from)?;
@@ -116,10 +130,35 @@ pub async fn upload_url(
             }
             None => format!("{dongle_id}/{path}"),
         },
-    };
+    })
+}
 
-    let url = sigv4::presign_url(s, "PUT", &key, URL_TTL);
-    Ok(Json(json!({ "url": url, "headers": {} })))
+#[derive(Deserialize)]
+pub struct UploadsBody {
+    paths: Vec<String>,
+}
+
+pub async fn upload_urls(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<UploadsBody>,
+) -> Result<Json<Value>> {
+    if !device::owned(&app.db, &dongle_id, user.id).await? || body.paths.len() > MAX_UPLOAD_URLS {
+        return Err(Error::NotFound);
+    }
+    let mut urls = Vec::with_capacity(body.paths.len());
+    for path in &body.paths {
+        let key = claim_key(
+            &app,
+            &dongle_id,
+            Some(user.id),
+            safe_path(path).ok_or(Error::Forbidden)?,
+        )
+        .await?;
+        urls.push(json!({ "url": sigv4::presign_url(storage(&app)?, "PUT", &key, URL_TTL) }));
+    }
+    Ok(Json(Value::Array(urls)))
 }
 
 /// connect は `route.url` にパスを連結する（`cached.js:307`）のでクエリ署名は使えない。
@@ -392,10 +431,10 @@ pub async fn routes_segments(
     Query(q): Query<RoutesQuery>,
 ) -> Result<Json<Value>> {
     let viewer = match &user {
-        Some(u) if device::owned(&app.db, &dongle_id, u.id).await? => Some(u.id),
-        _ => None,
+        Some(u) => device::readable(&app.db, &dongle_id, u.id).await?,
+        None => None,
     };
-    if viewer.is_some() {
+    if viewer == user.as_ref().map(|u| u.id) && viewer.is_some() {
         // connect は `[]` を 14 日キャッシュする（`cached.js:337`）ので先にパースする。
         let _ = tokio::time::timeout(HARVEST_BUDGET, harvest(&app, &dongle_id)).await;
     }
@@ -522,7 +561,11 @@ pub async fn bootlogs(
         "SELECT filename FROM bootlogs WHERE dongle_id = ?1 AND owner_id = ?2 ORDER BY filename",
     )
     .bind(&dongle_id)
-    .bind(user.id)
+    .bind(
+        device::readable(&app.db, &dongle_id, user.id)
+            .await?
+            .ok_or(Error::NotFound)?,
+    )
     .fetch_all(&app.db)
     .await
     .map_err(anyhow::Error::from)?;
@@ -536,6 +579,79 @@ pub async fn bootlogs(
     )))
 }
 
+pub async fn location(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<Value>> {
+    let owner = device::readable(&app.db, &dongle_id, user.id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let (lat, lng, time): (f64, f64, i64) = sqlx::query_as(
+        "SELECT s.last_lat, s.last_lng, s.start_millis + s.end_offset FROM segments s
+          WHERE s.dongle_id = ?1 AND s.last_lat IS NOT NULL
+            AND EXISTS (SELECT 1 FROM uploads u WHERE u.dongle_id = s.dongle_id
+                         AND u.route_name = s.route_name AND u.owner_id = ?2)
+          ORDER BY s.start_millis DESC, s.segment DESC LIMIT 1",
+    )
+    .bind(&dongle_id)
+    .bind(owner)
+    .fetch_optional(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    .ok_or(Error::NotFound)?;
+    Ok(Json(json!({ "lat": lat, "lng": lng, "time": time })))
+}
+
+pub async fn preserved(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<Value>> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT route_name FROM routes WHERE dongle_id = ?1 AND owner_id = ?2 AND preserved",
+    )
+    .bind(&dongle_id)
+    .bind(user.id)
+    .fetch_all(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?;
+    Ok(Json(json!(
+        names
+            .iter()
+            .map(|n| json!({ "fullname": format!("{dongle_id}|{n}") }))
+            .collect::<Vec<_>>()
+    )))
+}
+
+pub async fn set_preserved(
+    State(app): State<AppState>,
+    Path(route_name): Path<String>,
+    method: Method,
+    user: CurrentUser,
+) -> Result<Json<Value>> {
+    let (dongle_id, name) = route_name.split_once('|').ok_or(Error::NotFound)?;
+    let updated = sqlx::query(
+        "INSERT INTO routes (dongle_id, route_name, owner_id, preserved) SELECT ?1, ?2, ?3, ?4
+          WHERE EXISTS (SELECT 1 FROM uploads u JOIN devices d ON d.dongle_id = u.dongle_id
+                         WHERE u.dongle_id = ?1 AND u.route_name = ?2
+                           AND u.owner_id = ?3 AND d.owner_id = ?3)
+         ON CONFLICT DO UPDATE SET preserved = ?4",
+    )
+    .bind(dongle_id)
+    .bind(name)
+    .bind(user.id)
+    .bind(method == Method::POST)
+    .execute(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    .rows_affected();
+    if updated == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(Json(json!({ "success": 1 })))
+}
+
 pub async fn files(
     State(app): State<AppState>,
     Path(route_name): Path<String>,
@@ -543,19 +659,20 @@ pub async fn files(
 ) -> Result<Json<Value>> {
     let (dongle_id, name) = route_name.split_once('|').ok_or(Error::NotFound)?;
     // 未ログインで公開リンクを踏んだ閲覧者にも、認証済み非オーナーと同じ空を返す。
-    let Some(user) = user else {
+    let owner = match user {
+        Some(u) => device::readable(&app.db, dongle_id, u.id).await?,
+        None => None,
+    };
+    let Some(owner) = owner else {
         return Ok(Json(json!({})));
     };
-    if !device::owned(&app.db, dongle_id, user.id).await? {
-        return Ok(Json(json!({})));
-    }
     let rows: Vec<(i64, String)> = sqlx::query_as(
         "SELECT segment, filename FROM uploads
          WHERE dongle_id = ?1 AND route_name = ?2 AND owner_id = ?3 ORDER BY segment",
     )
     .bind(dongle_id)
     .bind(name)
-    .bind(user.id)
+    .bind(owner)
     .fetch_all(&app.db)
     .await
     .map_err(anyhow::Error::from)?;
@@ -590,7 +707,11 @@ pub async fn stats(
           WHERE d.dongle_id = ?1 AND d.owner_id = ?2 GROUP BY d.dongle_id",
     )
     .bind(&dongle_id)
-    .bind(user.id)
+    .bind(
+        device::readable(&app.db, &dongle_id, user.id)
+            .await?
+            .ok_or(Error::NotFound)?,
+    )
     .fetch_optional(&app.db)
     .await
     .map_err(anyhow::Error::from)?

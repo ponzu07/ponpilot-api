@@ -24,13 +24,15 @@ pub type Peers = Arc<Mutex<HashMap<String, mpsc::Sender<Call>>>>;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 
-const ALLOWED: [&str; 6] = [
+const ALLOWED: [&str; 8] = [
     "setRouteViewed",
     "listUploadQueue",
     "cancelUpload",
     "getNetworkMetered",
     "getNetworkType",
     "getNotCar",
+    "uploadFileToUrl",
+    "uploadFilesToUrls",
 ];
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -94,14 +96,7 @@ mod tests {
 
     #[test]
     fn denied_methods_never_use_32000() {
-        for m in [
-            "uploadFilesToUrls",
-            "uploadFileToUrl",
-            "startLocalProxy",
-            "getMessage",
-            "getVersion",
-            "",
-        ] {
+        for m in ["startLocalProxy", "getMessage", "getVersion", "reboot", ""] {
             assert!(!ALLOWED.contains(&m));
             let e = not_found(json!(0), m);
             assert_eq!(e["error"]["code"], -32601, "-32000 は TypeError を起こす");

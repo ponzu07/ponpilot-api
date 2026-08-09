@@ -15,11 +15,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
-    Router,
+    Json, Router,
     http::{HeaderValue, Method, header},
     routing::{get, patch, post},
 };
 use config::Config;
+use serde_json::json;
 use sqlx::SqlitePool;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
@@ -65,7 +66,9 @@ async fn main() -> Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/v1/me", get(user::me))
         .route("/v1/me/", get(user::me))
+        .route("/v1/me/turn", get(user::turn))
         .route("/v1/me/devices/", get(device::list))
+        .route("/v1/prime/subscription", get(user::subscription))
         .route(
             "/v1.1/devices/{dongle_id}",
             get(device::get).delete(device::remove),
@@ -74,6 +77,12 @@ async fn main() -> Result<()> {
         .route("/v1.1/devices/{dongle_id}/stats", get(route::stats))
         .route("/v1/devices/{dongle_id}/", patch(device::set_alias))
         .route("/v1/devices/{dongle_id}/unpair", post(device::unpair))
+        .route("/v1/devices/{dongle_id}/add_user", post(device::add_user))
+        .route("/v1/devices/{dongle_id}/location", get(route::location))
+        .route(
+            "/v1/devices/{dongle_id}/athena_offline_queue",
+            get(|| async { Json(json!([])) }),
+        )
         .route(
             "/v1/devices/{dongle_id}/firehose_stats",
             get(device::firehose_stats),
@@ -86,8 +95,17 @@ async fn main() -> Result<()> {
             get(route::routes_segments),
         )
         .route("/v1/devices/{dongle_id}/bootlogs", get(route::bootlogs))
+        .route(
+            "/v1/devices/{dongle_id}/routes/preserved",
+            get(route::preserved),
+        )
+        .route("/v1/{dongle_id}/upload_urls/", post(route::upload_urls))
         .route("/v1/route/{route_name}", get(route::get))
         .route("/v1/route/{route_name}/", patch(route::set_public))
+        .route(
+            "/v1/route/{route_name}/preserve",
+            post(route::set_preserved).delete(route::set_preserved),
+        )
         .route("/v1/route/{route_name}/files", get(route::files))
         .route(
             "/v1/route/{route_name}/qcamera.m3u8",

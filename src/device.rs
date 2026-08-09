@@ -82,6 +82,20 @@ pub async fn owned(db: &SqlitePool, dongle_id: &str, user_id: i64) -> Result<boo
     Ok(find(db, dongle_id).await?.and_then(|d| d.owner_id) == Some(user_id))
 }
 
+pub async fn readable(db: &SqlitePool, dongle_id: &str, user_id: i64) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT d.owner_id FROM devices d
+          WHERE d.dongle_id = ?1 AND d.owner_id IS NOT NULL
+            AND (d.owner_id = ?2 OR EXISTS (SELECT 1 FROM device_shares s
+                  WHERE s.dongle_id = ?1 AND s.user_id = ?2 AND s.owner_id = d.owner_id))",
+    )
+    .bind(dongle_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(anyhow::Error::from)?)
+}
+
 impl Device {
     fn json(&self, viewer: Option<i64>) -> Value {
         json!({
@@ -90,9 +104,9 @@ impl Device {
             // 欠けると connect が "comma undefined" と表示する（`utils/index.js:53-59`）。
             "device_type": "unknown",
             "is_owner": viewer.is_some() && viewer == self.owner_id,
-            "shared": false,
+            "shared": viewer.is_some() && viewer != self.owner_id,
             "prime": true,
-            "prime_type": 0,
+            "prime_type": 2,
             "is_paired": self.owner_id.is_some(),
             "last_athena_ping": self.last_athena_ping,
             "openpilot_version": self.openpilot_version,
@@ -103,7 +117,9 @@ impl Device {
 pub async fn list(State(app): State<AppState>, user: CurrentUser) -> Result<Json<Value>> {
     let rows: Vec<Device> = sqlx::query_as(
         "SELECT dongle_id, public_key, owner_id, last_athena_ping, openpilot_version, alias
-         FROM devices WHERE owner_id = ?1",
+         FROM devices WHERE owner_id = ?1
+            OR EXISTS (SELECT 1 FROM device_shares s WHERE s.dongle_id = devices.dongle_id
+                        AND s.user_id = ?1 AND s.owner_id = devices.owner_id)",
     )
     .bind(user.id)
     .fetch_all(&app.db)
@@ -132,9 +148,9 @@ pub async fn get(
                 .await?
                 .ok_or(Error::Unauthorized)?;
             // 他人のデバイスに 401 を返すとフロントが強制ログアウトする
-            if device.owner_id != Some(id) {
-                return Err(Error::NotFound);
-            }
+            readable(&app.db, &dongle_id, id)
+                .await?
+                .ok_or(Error::NotFound)?;
             Ok(Json(device.json(Some(id))))
         }
         Err(_) => {
@@ -192,6 +208,45 @@ pub async fn set_alias(
     .map_err(anyhow::Error::from)?
     .ok_or(Error::NotFound)?;
     Ok(Json(device.json(Some(user.id))))
+}
+
+#[derive(Deserialize)]
+pub struct ShareBody {
+    email: String,
+}
+
+pub async fn add_user(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<ShareBody>,
+) -> Result<Json<Value>> {
+    let target: i64 = sqlx::query_scalar(
+        "SELECT id FROM users WHERE identity = ?1 OR username = ?1 COLLATE NOCASE
+          ORDER BY identity = ?1 DESC LIMIT 1",
+    )
+    .bind(body.email.trim())
+    .fetch_optional(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    .ok_or(Error::NotFound)?;
+
+    let shared = sqlx::query(
+        "INSERT INTO device_shares (dongle_id, owner_id, user_id) SELECT ?1, ?2, ?3
+          WHERE ?2 <> ?3 AND EXISTS (SELECT 1 FROM devices WHERE dongle_id = ?1 AND owner_id = ?2)
+         ON CONFLICT DO UPDATE SET owner_id = ?2",
+    )
+    .bind(&dongle_id)
+    .bind(user.id)
+    .bind(target)
+    .execute(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?
+    .rows_affected();
+    if shared == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(Json(json!({ "success": 1 })))
 }
 
 #[derive(Deserialize)]
@@ -332,6 +387,11 @@ pub async fn unpair(
     if updated == 0 {
         return Err(Error::NotFound);
     }
+    sqlx::query("DELETE FROM device_shares WHERE dongle_id = ?1")
+        .bind(&dongle_id)
+        .execute(&app.db)
+        .await
+        .map_err(anyhow::Error::from)?;
     Ok(Json(json!({ "success": 1 })))
 }
 

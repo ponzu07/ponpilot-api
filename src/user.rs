@@ -55,6 +55,23 @@ impl OptionalFromRequestParts<AppState> for CurrentUser {
     }
 }
 
+pub async fn turn(_user: CurrentUser) -> Json<Value> {
+    Json(json!({ "iceServers": [{ "urls": "stun:stun.l.google.com:19302" }] }))
+}
+
+pub async fn subscription(user: CurrentUser) -> Json<Value> {
+    Json(json!({
+        "user_id": user.identity,
+        "plan": "nodata",
+        "amount": 0,
+        "subscribed_at": 0,
+        "next_charge_at": null,
+        "cancel_at": null,
+        "is_prime_sim": false,
+        "requires_migration": false,
+    }))
+}
+
 pub async fn me(State(app): State<AppState>, user: CurrentUser) -> Json<Value> {
     Json(json!({
         "id": user.id,
