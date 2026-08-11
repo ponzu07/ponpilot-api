@@ -5,6 +5,7 @@ mod db;
 mod device;
 mod error;
 mod qlog;
+mod retention;
 mod route;
 mod rpc;
 mod sigv4;
@@ -15,12 +16,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
-    Json, Router,
+    Router,
     http::{HeaderValue, Method, header},
     routing::{get, patch, post},
 };
 use config::Config;
-use serde_json::json;
 use sqlx::SqlitePool;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
@@ -62,6 +62,19 @@ async fn main() -> Result<()> {
         tofu: Arc::new(tokio::sync::Semaphore::new(athena::MAX_TOFU)),
     };
 
+    if state.config.retention_days > 0 {
+        let app = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                tick.tick().await;
+                if let Err(e) = retention::sweep(&app).await {
+                    tracing::error!("retention: {e:#}");
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/me", get(user::me))
@@ -81,7 +94,7 @@ async fn main() -> Result<()> {
         .route("/v1/devices/{dongle_id}/location", get(route::location))
         .route(
             "/v1/devices/{dongle_id}/athena_offline_queue",
-            get(|| async { Json(json!([])) }),
+            get(rpc::queued),
         )
         .route(
             "/v1/devices/{dongle_id}/firehose_stats",

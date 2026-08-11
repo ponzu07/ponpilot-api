@@ -8,6 +8,8 @@ pub struct Config {
     pub frontend_url: String,
     pub database: String,
     pub jwt_secret: String,
+    pub retention_days: i64,
+    pub retention_dry_run: bool,
     superusers: HashSet<String>,
     pub github: Option<OAuthProvider>,
     pub storage: Option<Storage>,
@@ -52,6 +54,10 @@ impl Config {
                 anyhow::ensure!(s.len() >= 32, "JWT_SECRET must be at least 32 bytes");
                 s
             },
+            retention_days: optional("RETENTION_DAYS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            retention_dry_run: optional("RETENTION_DRY_RUN").is_none_or(|v| v != "0"),
             superusers: optional("SUPERUSERS")
                 .unwrap_or_default()
                 .split(',')

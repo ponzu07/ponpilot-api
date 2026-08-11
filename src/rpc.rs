@@ -23,6 +23,10 @@ pub type Call = (u64, String, oneshot::Sender<Value>);
 pub type Peers = Arc<Mutex<HashMap<String, mpsc::Sender<Call>>>>;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_EXPIRY: i64 = 7 * 24 * 60 * 60;
+const MAX_QUEUED: i64 = 256;
+
+const QUEUED: [&str; 2] = ["uploadFileToUrl", "uploadFilesToUrls"];
 
 const ALLOWED: [&str; 8] = [
     "setRouteViewed",
@@ -45,6 +49,100 @@ fn offline(id: Value) -> Value {
 fn not_found(id: Value, method: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id,
             "error": { "code": -32601, "message": format!("method not found: {method}") } })
+}
+
+fn bad_params(id: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32602, "message": "url is not in this instance's bucket" } })
+}
+
+fn collect_urls(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) if s.starts_with("http") => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| collect_urls(x, out)),
+        Value::Object(o) => o.values().for_each(|x| collect_urls(x, out)),
+        _ => {}
+    }
+}
+
+fn own_bucket(app: &AppState, dongle_id: &str, params: &Value) -> bool {
+    let Some(s) = app.config.storage.as_ref() else {
+        return false;
+    };
+    let prefix = format!("{}/{}/{dongle_id}/", s.endpoint, s.bucket);
+    let mut urls = Vec::new();
+    collect_urls(params, &mut urls);
+    !urls.is_empty() && urls.iter().all(|u| u.starts_with(&prefix))
+}
+
+async fn enqueue(app: &AppState, dongle_id: &str, req: &Value) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO athena_queue (dongle_id, method, params, expiry)
+         SELECT ?1, ?2, ?3, min(coalesce(?4, unixepoch() + ?5), unixepoch() + ?5)
+          WHERE (SELECT count(*) FROM athena_queue WHERE dongle_id = ?1) < ?6",
+    )
+    .bind(dongle_id)
+    .bind(req["method"].as_str().unwrap_or_default())
+    .bind(req["params"].to_string())
+    .bind(req["expiry"].as_i64())
+    .bind(MAX_EXPIRY)
+    .bind(MAX_QUEUED)
+    .execute(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+pub async fn queued(
+    State(app): State<AppState>,
+    Path(dongle_id): Path<String>,
+    user: crate::user::CurrentUser,
+) -> Result<Json<Value>> {
+    if !device::owned(&app.db, &dongle_id, user.id).await? {
+        return Err(Error::NotFound);
+    }
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT method, params, expiry FROM athena_queue
+          WHERE dongle_id = ?1 AND expiry > unixepoch() ORDER BY id",
+    )
+    .bind(&dongle_id)
+    .fetch_all(&app.db)
+    .await
+    .map_err(anyhow::Error::from)?;
+    Ok(Json(Value::Array(
+        rows.iter()
+            .map(|(method, params, expiry)| {
+                json!({
+                    "method": method,
+                    "params": serde_json::from_str::<Value>(params).unwrap_or(Value::Null),
+                    "expiry": expiry,
+                })
+            })
+            .collect(),
+    )))
+}
+
+pub async fn drain(app: &AppState, dongle_id: &str) -> Vec<String> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "DELETE FROM athena_queue WHERE dongle_id = ?1
+         RETURNING method, params, expiry > unixepoch()",
+    )
+    .bind(dongle_id)
+    .fetch_all(&app.db)
+    .await
+    .unwrap_or_default();
+    rows.iter()
+        .filter(|(_, _, alive)| *alive != 0)
+        .map(|(method, params, _)| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": NEXT.fetch_add(1, Ordering::Relaxed),
+                "method": method,
+                "params": serde_json::from_str::<Value>(params).unwrap_or(Value::Null),
+            })
+            .to_string()
+        })
+        .collect()
 }
 
 fn call(id: u64, req: &Value) -> Value {
@@ -74,12 +172,23 @@ pub async fn relay(
         return Ok(Json(not_found(cid, method)));
     }
 
+    let queueable = QUEUED.contains(&method);
+    if queueable && !own_bucket(&app, &dongle_id, &req["params"]) {
+        return Ok(Json(bad_params(cid)));
+    }
+
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let body = call(id, &req).to_string();
     let (reply, wait) = oneshot::channel();
     let peer = app.peers.lock().unwrap().get(&dongle_id).cloned();
     if !peer.is_some_and(|p| p.try_send((id, body, reply)).is_ok()) {
-        return Ok(Json(offline(cid)));
+        if !queueable {
+            return Ok(Json(offline(cid)));
+        }
+        enqueue(&app, &dongle_id, &req).await?;
+        return Ok(Json(
+            json!({ "jsonrpc": "2.0", "id": cid, "result": "Device offline, message queued" }),
+        ));
     }
     match tokio::time::timeout(RPC_TIMEOUT, wait).await {
         Ok(Ok(mut resp)) => {

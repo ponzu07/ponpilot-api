@@ -106,6 +106,9 @@ async fn pump(
 
     let probe = json!({ "jsonrpc": "2.0", "id": "version", "method": "getVersion" });
     let _ = socket.send(Message::Text(probe.to_string().into())).await;
+    for body in crate::rpc::drain(&app, &dongle_id).await {
+        let _ = socket.send(Message::Text(body.into())).await;
+    }
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     let mut alive = true;
