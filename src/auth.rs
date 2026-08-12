@@ -39,16 +39,24 @@ fn issued_state(headers: &HeaderMap) -> Option<&str> {
         })
 }
 
+#[derive(Deserialize)]
+pub struct Start {
+    state: Option<String>,
+}
+
 pub async fn start(
     State(app): State<AppState>,
     Path(provider): Path<String>,
+    Query(params): Query<Start>,
 ) -> Result<impl IntoResponse> {
     if provider != "h" {
         return Err(Error::UnknownProvider);
     }
     let github = app.config.github.as_ref().ok_or(Error::ProviderDisabled)?;
 
-    let state = Alphanumeric.sample_string(&mut rand::rng(), 32);
+    let state = params
+        .state
+        .unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::rng(), 32));
     let mut url = Url::parse("https://github.com/login/oauth/authorize").unwrap();
     url.query_pairs_mut()
         .append_pair("client_id", &github.client_id)
@@ -87,7 +95,14 @@ pub async fn callback(
                 .append_pair("code", &code)
                 .append_pair("provider", &provider)
                 .finish();
-            format!("{}/auth/?{query}", app.config.frontend_url)
+            match params
+                .state
+                .strip_prefix("service,localhost:")
+                .and_then(|p| p.parse::<u16>().ok())
+            {
+                Some(port) => format!("http://localhost:{port}/auth?{query}"),
+                None => format!("{}/auth/?{query}", app.config.frontend_url),
+            }
         }
         None => app.config.frontend_url.clone(),
     };
