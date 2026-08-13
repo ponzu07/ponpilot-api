@@ -31,6 +31,7 @@ struct AppState {
     db: SqlitePool,
     http: reqwest::Client,
     peers: rpc::Peers,
+    streaming: rpc::Streaming,
     tofu: athena::Tofu,
 }
 
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
             .build()?,
         config: Arc::new(config),
         peers: Default::default(),
+        streaming: Default::default(),
         tofu: Arc::new(tokio::sync::Semaphore::new(athena::MAX_TOFU)),
     };
 

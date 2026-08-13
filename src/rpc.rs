@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -21,14 +21,17 @@ use crate::{
 
 pub type Call = (u64, String, oneshot::Sender<Value>);
 pub type Peers = Arc<Mutex<HashMap<String, mpsc::Sender<Call>>>>;
+pub type Streaming = Arc<Mutex<HashSet<String>>>;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+const STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_EXPIRY: i64 = 7 * 24 * 60 * 60;
 const MAX_QUEUED: i64 = 256;
 
 const QUEUED: [&str; 2] = ["uploadFileToUrl", "uploadFilesToUrls"];
+const STREAM: &str = "startStream";
 
-const ALLOWED: [&str; 8] = [
+const ALLOWED: [&str; 9] = [
     "setRouteViewed",
     "listUploadQueue",
     "cancelUpload",
@@ -37,9 +40,18 @@ const ALLOWED: [&str; 8] = [
     "getNotCar",
     "uploadFileToUrl",
     "uploadFilesToUrls",
+    STREAM,
 ];
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+
+struct Exclusive(Streaming, String);
+
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().remove(&self.1);
+    }
+}
 
 fn offline(id: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id,
@@ -54,6 +66,11 @@ fn not_found(id: Value, method: &str) -> Value {
 fn bad_params(id: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id,
             "error": { "code": -32602, "message": "url is not in this instance's bucket" } })
+}
+
+fn busy(id: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32002, "message": "another stream request is in flight" } })
 }
 
 fn collect_urls(v: &Value, out: &mut Vec<String>) {
@@ -177,6 +194,12 @@ pub async fn relay(
         return Ok(Json(bad_params(cid)));
     }
 
+    let stream = method == STREAM;
+    if stream && !app.streaming.lock().unwrap().insert(dongle_id.clone()) {
+        return Ok(Json(busy(cid)));
+    }
+    let _exclusive = stream.then(|| Exclusive(app.streaming.clone(), dongle_id.clone()));
+
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let body = call(id, &req).to_string();
     let (reply, wait) = oneshot::channel();
@@ -190,7 +213,8 @@ pub async fn relay(
             json!({ "jsonrpc": "2.0", "id": cid, "result": "Device offline, message queued" }),
         ));
     }
-    match tokio::time::timeout(RPC_TIMEOUT, wait).await {
+    let deadline = if stream { STREAM_TIMEOUT } else { RPC_TIMEOUT };
+    match tokio::time::timeout(deadline, wait).await {
         Ok(Ok(mut resp)) => {
             resp["id"] = cid;
             Ok(Json(resp))
@@ -211,6 +235,34 @@ mod tests {
             assert_eq!(e["error"]["code"], -32601, "-32000 は TypeError を起こす");
             assert_eq!(e["error"]["message"], format!("method not found: {m}"));
         }
+    }
+
+    #[test]
+    fn stream_lock_releases_on_drop() {
+        let live: Streaming = Default::default();
+        assert!(live.lock().unwrap().insert("dead".into()), "1本目は通る");
+        let held = Exclusive(live.clone(), "dead".into());
+        assert!(!live.lock().unwrap().insert("dead".into()), "2本目は busy");
+        assert!(
+            live.lock().unwrap().insert("beef".into()),
+            "別デバイスは独立"
+        );
+        drop(held);
+        assert!(
+            live.lock().unwrap().insert("dead".into()),
+            "drop で解放される"
+        );
+        assert_eq!(busy(json!(0))["error"]["code"], -32002);
+    }
+
+    #[test]
+    fn stream_timeout_covers_device_side() {
+        assert!(ALLOWED.contains(&STREAM));
+        assert!(
+            !QUEUED.contains(&STREAM),
+            "offline queue に積むと SDP が腐る"
+        );
+        assert!(STREAM_TIMEOUT >= Duration::from_secs(25));
     }
 
     #[test]
