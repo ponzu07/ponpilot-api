@@ -587,7 +587,7 @@ pub async fn location(
     let owner = device::readable(&app.db, &dongle_id, user.id)
         .await?
         .ok_or(Error::NotFound)?;
-    let (lat, lng, time): (f64, f64, i64) = sqlx::query_as(
+    let row: Option<(f64, f64, i64)> = sqlx::query_as(
         "SELECT s.last_lat, s.last_lng, s.start_millis + s.end_offset FROM segments s
           WHERE s.dongle_id = ?1 AND s.last_lat IS NOT NULL
             AND EXISTS (SELECT 1 FROM uploads u WHERE u.dongle_id = s.dongle_id
@@ -598,9 +598,11 @@ pub async fn location(
     .bind(owner)
     .fetch_optional(&app.db)
     .await
-    .map_err(anyhow::Error::from)?
-    .ok_or(Error::NotFound)?;
-    Ok(Json(json!({ "lat": lat, "lng": lng, "time": time })))
+    .map_err(anyhow::Error::from)?;
+    Ok(Json(match row {
+        Some((lat, lng, time)) => json!({ "lat": lat, "lng": lng, "time": time }),
+        None => json!({ "error": "no_segments_uploaded" }),
+    }))
 }
 
 pub async fn preserved(
