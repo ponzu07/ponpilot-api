@@ -17,6 +17,13 @@ use crate::{
 
 const STATE_COOKIE: &str = "__Host-oauth_state";
 
+fn valid_state(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b",:._-".contains(&b))
+}
+
 fn set_state(value: &str, max_age: u32) -> [(header::HeaderName, String); 1] {
     [(
         header::SET_COOKIE,
@@ -54,9 +61,11 @@ pub async fn start(
     }
     let github = app.config.github.as_ref().ok_or(Error::ProviderDisabled)?;
 
-    let state = params
-        .state
-        .unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::rng(), 32));
+    let state = match params.state {
+        Some(s) if valid_state(&s) => s,
+        Some(_) => return Err(Error::InvalidState),
+        None => Alphanumeric.sample_string(&mut rand::rng(), 32),
+    };
     let mut url = Url::parse("https://github.com/login/oauth/authorize").unwrap();
     url.query_pairs_mut()
         .append_pair("client_id", &github.client_id)
@@ -173,4 +182,31 @@ struct GithubToken {
 struct GithubUser {
     id: u64,
     login: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_cannot_escape_the_cookie() {
+        assert!(valid_state("service,localhost:9999"));
+        assert!(valid_state("aB0._-"));
+
+        for bad in [
+            "",
+            "a b",
+            "a;Path=/",
+            "a\r\nX-Injected: 1",
+            "a\nb",
+            "a=b",
+            "日本語",
+        ] {
+            assert!(!valid_state(bad), "{bad:?} を通してはいけない");
+        }
+        assert!(!valid_state(&"a".repeat(129)));
+
+        let header = set_state("service,localhost:9999", 600)[0].1.clone();
+        assert_eq!(header.lines().count(), 1);
+    }
 }
