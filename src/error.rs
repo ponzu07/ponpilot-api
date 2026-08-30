@@ -13,6 +13,8 @@ pub enum Error {
     Forbidden,
     #[error("not found")]
     NotFound,
+    #[error("device offline")]
+    Offline,
     #[error("too many requests")]
     TooManyRequests,
     #[error("unknown provider")]
@@ -33,6 +35,7 @@ impl IntoResponse for Error {
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::Forbidden => StatusCode::FORBIDDEN,
             Error::NotFound | Error::UnknownProvider => StatusCode::NOT_FOUND,
+            Error::Offline => StatusCode::BAD_GATEWAY,
             Error::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             Error::ProviderDisabled | Error::InvalidState | Error::ExchangeFailed => {
                 StatusCode::BAD_REQUEST

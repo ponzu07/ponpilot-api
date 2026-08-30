@@ -5,7 +5,7 @@ use axum::{
         Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, header},
+    http::HeaderMap,
     response::Response,
 };
 use serde_json::{Value, json};
@@ -20,7 +20,7 @@ use crate::{
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const TOFU_TIMEOUT: Duration = Duration::from_secs(20);
 /// 未認証のまま TOFU 中のクライアントに 64MiB（tungstenite 既定）を確保させない。
-const MAX_MESSAGE: usize = 1 << 20;
+pub const MAX_MESSAGE: usize = 1 << 20;
 const MAX_RESPONSE: usize = 16 << 20;
 pub const MAX_TOFU: usize = 64;
 pub const MAX_DEVICES: i64 = 1000;
@@ -36,12 +36,7 @@ pub async fn ws(
     if !device::valid_dongle_id(&dongle_id) {
         return Err(Error::Unauthorized);
     }
-    let jwt = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').find_map(|c| c.trim().strip_prefix("jwt=")))
-        .ok_or(Error::Unauthorized)?
-        .to_string();
+    let jwt = device::cookie_jwt(&headers)?.to_string();
     if device::peek(&jwt)?.identity != dongle_id {
         return Err(Error::Unauthorized);
     }

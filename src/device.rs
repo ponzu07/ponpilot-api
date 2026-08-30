@@ -53,6 +53,14 @@ pub fn verify(pem: &str, jwt: &str) -> Result<DeviceClaims> {
     Ok(claims)
 }
 
+pub fn cookie_jwt(headers: &HeaderMap) -> Result<&str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').find_map(|c| c.trim().strip_prefix("jwt=")))
+        .ok_or(Error::Unauthorized)
+}
+
 pub fn valid_dongle_id(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }

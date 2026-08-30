@@ -9,6 +9,7 @@ mod retention;
 mod route;
 mod rpc;
 mod sigv4;
+mod ssh;
 mod token;
 mod user;
 
@@ -32,6 +33,7 @@ struct AppState {
     http: reqwest::Client,
     peers: rpc::Peers,
     streaming: rpc::Streaming,
+    proxies: ssh::Pending,
     tofu: athena::Tofu,
 }
 
@@ -61,6 +63,7 @@ async fn main() -> Result<()> {
         config: Arc::new(config),
         peers: Default::default(),
         streaming: Default::default(),
+        proxies: Default::default(),
         tofu: Arc::new(tokio::sync::Semaphore::new(athena::MAX_TOFU)),
     };
 
@@ -130,7 +133,9 @@ async fn main() -> Result<()> {
             "/v1/segments/{tok}/{d}/{route}/{seg}/{file}",
             get(route::segment_file),
         )
+        .route("/v1/devices/{dongle_id}/ssh", get(ssh::open))
         .route("/ws/v2/{dongle_id}", get(athena::ws))
+        .route("/ws/v2/{dongle_id}/proxy/{token}", get(ssh::attach))
         .route("/v2/auth/", post(auth::exchange))
         .route("/v2/auth/{provider}/", get(auth::start))
         .route("/v2/auth/{provider}/redirect/", get(auth::callback))

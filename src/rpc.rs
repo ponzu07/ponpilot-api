@@ -23,7 +23,7 @@ pub type Call = (u64, String, oneshot::Sender<Value>);
 pub type Peers = Arc<Mutex<HashMap<String, mpsc::Sender<Call>>>>;
 pub type Streaming = Arc<Mutex<HashSet<String>>>;
 
-const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+pub const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_EXPIRY: i64 = 7 * 24 * 60 * 60;
 const MAX_QUEUED: i64 = 256;
@@ -162,6 +162,15 @@ pub async fn drain(app: &AppState, dongle_id: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn dispatch(app: &AppState, dongle_id: &str, req: &Value) -> Option<oneshot::Receiver<Value>> {
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let body = call(id, req).to_string();
+    let (reply, wait) = oneshot::channel();
+    let peer = app.peers.lock().unwrap().get(dongle_id).cloned();
+    peer.is_some_and(|p| p.try_send((id, body, reply)).is_ok())
+        .then_some(wait)
+}
+
 fn call(id: u64, req: &Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -200,11 +209,7 @@ pub async fn relay(
     }
     let _exclusive = stream.then(|| Exclusive(app.streaming.clone(), dongle_id.clone()));
 
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let body = call(id, &req).to_string();
-    let (reply, wait) = oneshot::channel();
-    let peer = app.peers.lock().unwrap().get(&dongle_id).cloned();
-    if !peer.is_some_and(|p| p.try_send((id, body, reply)).is_ok()) {
+    let Some(wait) = dispatch(&app, &dongle_id, &req) else {
         if !queueable {
             return Ok(Json(offline(cid)));
         }
@@ -212,7 +217,7 @@ pub async fn relay(
         return Ok(Json(
             json!({ "jsonrpc": "2.0", "id": cid, "result": "Device offline, message queued" }),
         ));
-    }
+    };
     let deadline = if stream { STREAM_TIMEOUT } else { RPC_TIMEOUT };
     match tokio::time::timeout(deadline, wait).await {
         Ok(Ok(mut resp)) => {

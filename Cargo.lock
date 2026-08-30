@@ -1156,6 +1156,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "hmac 0.12.1",
  "jsonwebtoken",
  "rand 0.9.5",
