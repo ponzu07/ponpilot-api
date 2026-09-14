@@ -31,7 +31,7 @@ const MAX_QUEUED: i64 = 256;
 const QUEUED: [&str; 2] = ["uploadFileToUrl", "uploadFilesToUrls"];
 const STREAM: &str = "startStream";
 
-const ALLOWED: [&str; 10] = [
+const ALLOWED: [&str; 11] = [
     "setRouteViewed",
     "listUploadQueue",
     "cancelUpload",
@@ -39,6 +39,7 @@ const ALLOWED: [&str; 10] = [
     "getNetworkType",
     "getNotCar",
     "setDoorLock",
+    "getHvBattery",
     "uploadFileToUrl",
     "uploadFilesToUrls",
     STREAM,
